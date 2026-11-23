@@ -4,7 +4,7 @@
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL%203.0-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 meowdo is a cute, keyboard-driven todo list with a cat sidekick.  
-It runs in your terminal, supports tags, search, pinning, and saves everything in `~/.local/share/meowdo/todos.txt`.
+It runs in your terminal, supports tags, search, pinning, and saves everything in `~/.local/share/meowdo/meowdo.json`.
 
 ![SmartStatus screenshot](Meowdo.png)
 *(A colorful ncurses UI with a cat and tasks)*
@@ -12,13 +12,15 @@ It runs in your terminal, supports tags, search, pinning, and saves everything i
 ## Features
 
 - **tasks** – add, edit, delete, mark done
+- **descriptions** – every task can have a multiline description (`m` to edit, `v` to view)
+- **notes** – a separate NOTES tab for free-form multiline notes (`Tab` to switch)
 - **pinning** – keep important tasks on top
 - **tags** – assign tags, filter by 1–6, color-coded
 - **search** – live filtering with `/`
 - **progress bar** – shows how many tasks are done
 - **freaky cat** – changes mood depending on pending tasks
 - **celebration** – all tasks done? kitty party!
-- **persistent** – data saved to `~/.local/share/meowdo/todos.txt`
+- **persistent** – data saved to `~/.local/share/meowdo/meowdo.json`
 - **vim-like keys** – `j`/`k`, `g`/`G`, `PgUp`/`PgDn`
 
 ## Dependencies
@@ -115,17 +117,21 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
 
 | Key | Action |
 |-----|--------|
+| `Tab` | switch between TASKS and NOTES |
 | `j` / `↓` | move down |
 | `k` / `↑` | move up |
 | `g` / `G` | jump to top / bottom |
 | `PgUp` / `PgDn` | page up / down |
-| `n` | new task |
-| `e` | edit selected task |
+| `n` | new task / new note |
+| `e` | edit selected task / note |
+| `m` | edit task description; edit note in NOTES tab |
+| `Enter` | open memo — edit if empty, view otherwise |
+| `v` | view description / note full-screen |
 | `Space` | toggle done |
 | `p` | toggle pin |
 | `t` | set / clear tag |
-| `d` | delete selected task |
-| `D` | delete ALL tasks |
+| `d` | delete selected task / note |
+| `D` | delete ALL tasks / notes |
 | `/` | search |
 | `Esc` | clear search + tag filter |
 | `1` … `6` | filter by tag (color-coded) |
@@ -135,24 +141,41 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
 ## Data Storage
 
 - **Directory:** `~/.local/share/meowdo/`
-- **File:** `todos.txt` – plain text, editable (but careful with the format)
+- **File:** `meowdo.json` (version 1.4.0 and later)
 
-### Line format:
+### Format:
 
-```
-<P|->|<x| >|<tag>|<text>|<created_ts>|<done_ts>
+```json
+{
+  "version": 1,
+  "tasks": [
+    {
+      "pinned": false, "done": false,
+      "tag": "work", "text": "review PR",
+      "desc": "multi\nline description",
+      "created": 1678896000, "done_at": 1678899600
+    }
+  ],
+  "notes": [
+    { "text": "free-form multiline note", "created": 1678896000 }
+  ]
+}
 ```
 
-Example:
-```
-P|x|work|review PR|1678896000|1678899600
--| |home|buy cat food|1678896000|0
-```
+### Migrating from older versions
+
+Older meowdo versions stored tasks in a plain-text `todos.txt`
+(`<P|->|<x| >|<tag>|<text>|<created_ts>|<done_ts>` per line). If
+`meowdo.json` is missing but `todos.txt` is present, meowdo imports it
+automatically on first launch and writes `meowdo.json`. The legacy
+`todos.txt` is left untouched as a backup. Note that versions before
+1.4.0 cannot read `meowdo.json`.
 
 ## Notes
 
 - Tags are case-insensitive (stored lowercased)
-- Maximum 1024 todos (increase `MAX_TODOS` if needed)
+- Maximum 1024 todos and 512 notes (increase `MAX_TODOS` / `MAX_NOTES` if needed)
+- Task descriptions and notes support up to 8 lines of 64 characters each
 
 ## Troubleshooting
 

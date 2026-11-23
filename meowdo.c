@@ -23,8 +23,10 @@
  *  q                  quit
  * ------------------------------------------------------------------------------------------------------------------------------------------------------------------
  *
- * data: ~/.meowdo/todos.txt
- * line format: <P|->|<x| >|<tag>|<text>|<created_ts>|<done_ts>
+ * data: ~/.local/share/meowdo/meowdo.json
+ * json: {"version":1,"tasks":[{"pinned","done","tag","text","desc","created","done_at"}],
+ *        "notes":[{"text","created"}]}
+ * (legacy todos.txt pipe-format is auto-imported on first run)
  */
 
 #ifndef _XOPEN_SOURCE
@@ -36,6 +38,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <errno.h>
 #include <time.h>
 #include <ctype.h>
@@ -49,6 +52,13 @@
 #define MAX_UTAGS    64
 #define LIST_Y0       4
 #define BC_H         10
+#define MAX_DESC    4096
+#define MAX_NOTE    4096
+#define MAX_NOTES    512
+
+/* multiline editor limits (chars per line x lines) */
+#define ML_LINES      8
+#define ML_COLS      64
 
 /* layout breakpoints */
 #define MIN_COLS_FULL    80   /* below this: hide right pane */
@@ -105,17 +115,32 @@ typedef struct {
     bool   done, pinned;
     char   tag[MAX_TAG];
     char   text[MAX_LINE];
+    char   desc[MAX_DESC];
     time_t created_at;
     time_t done_at;
 } Todo;
 
+typedef struct {
+    char   text[MAX_NOTE];
+    time_t created_at;
+} Note;
+
+typedef enum { VIEW_TASKS, VIEW_NOTES } View;
+
 static Todo todos[MAX_TODOS];
 static int  todo_count = 0;
 static int  sel        = 0;
+static Note notes[MAX_NOTES];
+static int  note_count = 0;
+static int  sel_note   = 0;
+static View view        = VIEW_TASKS;
 static char search[MAX_LINE]    = "";
 static char filter_tag[MAX_TAG] = "";
 static int  vis[MAX_TODOS];
 static int  vis_count  = 0;
+static int  note_vis[MAX_NOTES];
+static int  note_vis_count = 0;
+static int  note_top   = 0;
 static char smsg[256]  = "";
 static int  smsg_ttl   = 0;
 static int  celebrate  = 0;
@@ -169,7 +194,23 @@ static void set_smsg(const char *m) {
 
 /* ------ paths ------ */
 static char* todo_path;
+static char* legacy_path;
 size_t todo_path_length;
+
+/* recursive mkdir (like mkdir -p) for the whole base path */
+static void mkdir_p(const char *path) {
+    char tmp[strlen(path) + 1];
+    strcpy(tmp, path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
 static void build_paths(void) {
     #define LOCAL_BUFFER_SIZE 64
 
@@ -190,16 +231,21 @@ static void build_paths(void) {
     else
         strcpy(base, ".");
 
-    if (mkdir(base,0755)!=0 && errno!=EEXIST){
+    mkdir_p(base);
+    if (access(base, W_OK)!=0) {
         todo_path_length = LOCAL_BUFFER_SIZE;
         todo_path = malloc(todo_path_length);
-        strcpy(todo_path, "todos.txt");
+        strcpy(todo_path, "meowdo.json");
+        legacy_path = malloc(LOCAL_BUFFER_SIZE);
+        strcpy(legacy_path, "todos.txt");
         return;
     }
 
     todo_path_length = strlen(base) + 1 + LOCAL_BUFFER_SIZE;
     todo_path = malloc(todo_path_length);
-    snprintf(todo_path,todo_path_length,"%s/todos.txt",base);
+    snprintf(todo_path,todo_path_length,"%s/meowdo.json",base);
+    legacy_path = malloc(todo_path_length);
+    snprintf(legacy_path,todo_path_length,"%s/todos.txt",base);
 }
 
 /* ------ tag cache ------ */
@@ -234,10 +280,287 @@ static void recount(void) {
     }
 }
 
+/* ------ JSON helpers (minimal, enough for our schema) ------ */
+static void jw_string(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p=(const unsigned char*)s; *p; p++) {
+        switch (*p) {
+        case '"':  fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\b': fputs("\\b",  f); break;
+        case '\f': fputs("\\f",  f); break;
+        case '\n': fputs("\\n",  f); break;
+        case '\r': fputs("\\r",  f); break;
+        case '\t': fputs("\\t",  f); break;
+        default:
+            if (*p < 0x20) fprintf(f,"\\u%04x",*p);
+            else fputc(*p, f);
+        }
+    }
+    fputc('"', f);
+}
+
+typedef struct { const char *p; } JParser;
+
+static void jp_ws(JParser *J) {
+    while (*J->p==' '||*J->p=='\t'||*J->p=='\n'||*J->p=='\r') J->p++;
+}
+static int jp_peek(JParser *J) { jp_ws(J); return (unsigned char)*J->p; }
+static int jp_ch(JParser *J, char c) {
+    if (jp_peek(J)==(unsigned char)c) { J->p++; return 1; }
+    return 0;
+}
+
+static int jp_hex4(JParser *J, unsigned *out) {
+    unsigned v=0;
+    for (int i=0;i<4;i++) {
+        char c=J->p[i]; unsigned d;
+        if      (c>='0'&&c<='9') d=(unsigned)(c-'0');
+        else if (c>='a'&&c<='f') d=(unsigned)(c-'a')+10;
+        else if (c>='A'&&c<='F') d=(unsigned)(c-'A')+10;
+        else return 0;
+        v=v*16+d;
+    }
+    J->p+=4; *out=v; return 1;
+}
+
+/* encode codepoint as UTF-8 into out; returns bytes written (1-4) */
+static int utf8_put(unsigned cp, char *out) {
+    if (cp<0x80)   { out[0]=(char)cp; return 1; }
+    if (cp<0x800)  { out[0]=0xC0|(char)(cp>>6);  out[1]=0x80|(char)(cp&0x3F); return 2; }
+    if (cp<0x10000){ out[0]=0xE0|(char)(cp>>12); out[1]=0x80|(char)((cp>>6)&0x3F);
+                     out[2]=0x80|(char)(cp&0x3F); return 3; }
+                     out[0]=0xF0|(char)(cp>>18);  out[1]=0x80|(char)((cp>>12)&0x3F);
+                     out[2]=0x80|(char)((cp>>6)&0x3F); out[3]=0x80|(char)(cp&0x3F); return 4;
+}
+
+/* parse a quoted JSON string into out (UTF-8, NUL-terminated).
+   over-long strings are truncated but still consumed. */
+static int jp_string(JParser *J, char *out, size_t n) {
+    if (!jp_ch(J,'"')) return 0;
+    size_t w=0;
+    while (*J->p && *J->p!='"') {
+        char tmp[4]; int tl=0; size_t need;
+        char c=*J->p;
+        if (c=='\\') {
+            J->p++;
+            char e=*J->p++;
+            switch (e) {
+            case '"':  tmp[0]='"';  tl=1; break;
+            case '\\': tmp[0]='\\'; tl=1; break;
+            case '/':  tmp[0]='/';  tl=1; break;
+            case 'b':  tmp[0]='\b'; tl=1; break;
+            case 'f':  tmp[0]='\f'; tl=1; break;
+            case 'n':  tmp[0]='\n'; tl=1; break;
+            case 'r':  tmp[0]='\r'; tl=1; break;
+            case 't':  tmp[0]='\t'; tl=1; break;
+            case 'u': {
+                unsigned cp;
+                if (!jp_hex4(J,&cp)) return 0;
+                if (cp>=0xD800&&cp<=0xDBFF) {  /* high surrogate */
+                    const char *sv=J->p;
+                    J->p+=2;                    /* skip "\u" of low surrogate */
+                    unsigned lo;
+                    if (jp_hex4(J,&lo)&&lo>=0xDC00&&lo<=0xDFFF)
+                        cp=0x10000+((cp-0xD800)<<10)+(lo-0xDC00);
+                    else J->p=sv;               /* not a pair: leave as-is */
+                }
+                tl=utf8_put(cp,tmp);
+                break;
+            }
+            default: return 0;
+            }
+        } else {
+            tmp[0]=c; tl=1; J->p++;
+        }
+        need=(size_t)tl;
+        if (w+need<n) { memcpy(out+w,tmp,need); w+=need; }
+        else if (w<n) { memcpy(out+w,tmp,n-1-w); w=n; }
+    }
+    if (*J->p!='"') return 0;
+    J->p++;
+    if (n>0) { if (w>=n) w=n-1; out[w]='\0'; }
+    return 1;
+}
+
+static bool jp_bool(JParser *J) {
+    jp_ws(J);
+    if (!strncmp(J->p,"true",4))  { J->p+=4; return true; }
+    if (!strncmp(J->p,"false",5)) { J->p+=5; return false; }
+    return false;
+}
+
+static long long jp_number(JParser *J) {
+    jp_ws(J);
+    char *end;
+    long long v=strtoll(J->p,&end,10);
+    if (end==J->p) return 0;
+    J->p=end;
+    return v;
+}
+
+/* skip any JSON value (used for unknown fields) */
+static void jp_skip_value(JParser *J) {
+    int c=jp_peek(J);
+    if (c=='"') { J->p++;
+        while (*J->p && *J->p!='"') {
+            if (*J->p=='\\'&&J->p[1]) J->p++;
+            J->p++;
+        }
+        if (*J->p) J->p++;
+        return;
+    }
+    if (c=='[') {
+        J->p++;
+        for(;;) {
+            int ch=jp_peek(J);
+            if (!ch) return;
+            if (ch==']') { J->p++; return; }
+            if (ch==',') { J->p++; continue; }
+            jp_skip_value(J);
+        }
+    }
+    if (c=='{') {
+        J->p++;
+        for(;;) {
+            int ch=jp_peek(J);
+            if (!ch) return;
+            if (ch=='}') { J->p++; return; }
+            if (ch==',') { J->p++; continue; }
+            if (ch==':') { J->p++; continue; }
+            jp_skip_value(J);
+        }
+    }
+    if (!strncmp(J->p,"true",4))  { J->p+=4; return; }
+    if (!strncmp(J->p,"false",5)) { J->p+=5; return; }
+    if (!strncmp(J->p,"null",4))  { J->p+=4; return; }
+    while (*J->p && strchr("+-.0123456789eE",*J->p)) J->p++;
+}
+
 /* ------ I/O ------ */
-static void todos_load(void) {
+static int jp_task_obj(JParser *J) {
+    Todo t; memset(&t,0,sizeof t);
+    t.done_at=0;
+    for(;;) {
+        char key[32];
+        int ch=jp_peek(J);
+        if (ch=='}') { J->p++; break; }
+        if (ch==',') { J->p++; continue; }
+        if (ch!='"') return 0;
+        if (!jp_string(J,key,sizeof key)) return 0;
+        if (!jp_ch(J,':')) return 0;
+        if      (!strcmp(key,"pinned"))  t.pinned=jp_bool(J);
+        else if (!strcmp(key,"done"))    t.done=jp_bool(J);
+        else if (!strcmp(key,"tag"))     jp_string(J,t.tag,MAX_TAG);
+        else if (!strcmp(key,"text"))    jp_string(J,t.text,MAX_LINE);
+        else if (!strcmp(key,"desc"))    jp_string(J,t.desc,MAX_DESC);
+        else if (!strcmp(key,"created")) t.created_at=(time_t)jp_number(J);
+        else if (!strcmp(key,"done_at")) t.done_at=(time_t)jp_number(J);
+        else jp_skip_value(J);
+    }
+    if (todo_count<MAX_TODOS) todos[todo_count++]=t;
+    return 1;
+}
+
+static int jp_note_obj(JParser *J) {
+    Note n; memset(&n,0,sizeof n);
+    for(;;) {
+        char key[32];
+        int ch=jp_peek(J);
+        if (ch=='}') { J->p++; break; }
+        if (ch==',') { J->p++; continue; }
+        if (ch!='"') return 0;
+        if (!jp_string(J,key,sizeof key)) return 0;
+        if (!jp_ch(J,':')) return 0;
+        if      (!strcmp(key,"text"))    jp_string(J,n.text,MAX_NOTE);
+        else if (!strcmp(key,"created")) n.created_at=(time_t)jp_number(J);
+        else jp_skip_value(J);
+    }
+    if (note_count<MAX_NOTES) notes[note_count++]=n;
+    return 1;
+}
+
+static int todos_load(void) {
+    FILE *f=fopen(todo_path,"rb"); if(!f) return 0;
+    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    if (sz<0||sz>1<<20) { fclose(f); return 0; }
+    char *buf=malloc((size_t)sz+1);
+    if (!buf) { fclose(f); return 0; }
+    size_t n=fread(buf,1,(size_t)sz,f);
+    buf[n]='\0';
+    fclose(f);
+
+    JParser J={buf};
+    int ok=0;
+    todo_count=0; note_count=0;
+    if (jp_ch(&J,'{')) {
+        ok=1;
+        for(;;) {
+            char key[32];
+            int ch=jp_peek(&J);
+            if (ch=='}') { J.p++; break; }
+            if (ch==',') { J.p++; continue; }
+            if (ch!='"') { ok=0; break; }
+            if (!jp_string(&J,key,sizeof key)) { ok=0; break; }
+            if (!jp_ch(&J,':')) { ok=0; break; }
+            if (!strcmp(key,"tasks")) {
+                if (!jp_ch(&J,'[')) { ok=0; break; }
+                for(;;) {
+                    int c2=jp_peek(&J);
+                    if (c2==']') { J.p++; break; }
+                    if (c2==',') { J.p++; continue; }
+                    if (c2!='{') { ok=0; break; }
+                    J.p++;
+                    if (!jp_task_obj(&J)) { ok=0; break; }
+                }
+            }
+            else if (!strcmp(key,"notes")) {
+                if (!jp_ch(&J,'[')) { ok=0; break; }
+                for(;;) {
+                    int c2=jp_peek(&J);
+                    if (c2==']') { J.p++; break; }
+                    if (c2==',') { J.p++; continue; }
+                    if (c2!='{') { ok=0; break; }
+                    J.p++;
+                    if (!jp_note_obj(&J)) { ok=0; break; }
+                }
+            }
+            else jp_skip_value(&J);
+        }
+    }
+    free(buf);
+    return ok;
+}
+
+static void todos_save(void) {
+    FILE *f=fopen(todo_path,"w"); if(!f) return;
+    fprintf(f,"{\n \"version\": 1,\n \"tasks\": [\n");
+    for (int i=0;i<todo_count;i++){
+        Todo *t=&todos[i];
+        fprintf(f,"  {\"pinned\": %s, \"done\": %s, \"tag\": ",
+            t->pinned?"true":"false", t->done?"true":"false");
+        jw_string(f,t->tag[0]?t->tag:"none");
+        fprintf(f,", \"text\": "); jw_string(f,t->text);
+        fprintf(f,", \"desc\": ");  jw_string(f,t->desc);
+        fprintf(f,", \"created\": %ld, \"done_at\": %ld }%s\n",
+            (long)t->created_at,(long)t->done_at, i+1<todo_count?",":"");
+    }
+    fprintf(f," ],\n \"notes\": [\n");
+    for (int i=0;i<note_count;i++){
+        Note *nt=&notes[i];
+        fprintf(f,"  {\"text\": ");
+        jw_string(f,nt->text);
+        fprintf(f,", \"created\": %ld }%s\n",
+            (long)nt->created_at, i+1<note_count?",":"");
+    }
+    fprintf(f," ]\n}\n");
+    fclose(f);
+}
+
+/* one-time import of the old pipe-delimited todos.txt */
+static int todos_import_legacy(void) {
+    FILE *f=fopen(legacy_path,"r"); if(!f) return 0;
     todo_count=0;
-    FILE *f=fopen(todo_path,"r"); if(!f) return;
     char line[MAX_LINE+MAX_TAG+64];
     while (todo_count<MAX_TODOS && fgets(line,(int)sizeof line,f)) {
         int len=(int)strlen(line);
@@ -245,7 +568,7 @@ static void todos_load(void) {
         if (len<5) continue;
         Todo *t=&todos[todo_count];
         t->done_at=0;
-        t->tag[0]='\0';t->text[0]='\0';
+        t->tag[0]='\0';t->text[0]='\0';t->desc[0]='\0';
         t->pinned=(line[0]=='P');
         t->done  =(line[2]=='x');
         char *p1=strchr(line+4,'|'); if(!p1) continue;
@@ -267,19 +590,8 @@ static void todos_load(void) {
         }
         todo_count++;
     }
-    fclose(f); mark_dirty();
-}
-
-static void todos_save(void) {
-    FILE *f=fopen(todo_path,"w"); if(!f) return;
-    for (int i=0;i<todo_count;i++){
-        Todo *t=&todos[i];
-        fprintf(f,"%c|%c|%s|%s|%ld|%ld\n",
-            t->pinned?'P':'-', t->done?'x':' ',
-            t->tag[0]?t->tag:"none", t->text,
-            (long)t->created_at,(long)t->done_at);
-    }
     fclose(f);
+    return todo_count>0;
 }
 
 /* ------ sort / filter ------ */
@@ -311,6 +623,27 @@ static void rebuild_vis(void) {
     }
     if(sel>=vis_count) sel=vis_count>0?vis_count-1:0;
     mark_dirty();
+}
+
+static void rebuild_note_vis(void) {
+    note_vis_count=0;
+    char ndl[MAX_LINE]="";
+    if (search[0]) {
+        snprintf(ndl,sizeof ndl,"%s",search);
+        for(int j=0;ndl[j];j++) ndl[j]=(char)tolower((unsigned char)ndl[j]);
+    }
+    for(int i=0;i<note_count;i++){
+        Note *n=&notes[i];
+        if(search[0]){
+            char hay[MAX_NOTE];
+            strncpy(hay,n->text,sizeof hay-1);
+            hay[sizeof hay-1]='\0';
+            for(int j=0;hay[j];j++) hay[j]=(char)tolower((unsigned char)hay[j]);
+            if(!strstr(hay,ndl)) continue;
+        }
+        note_vis[note_vis_count++]=i;
+    }
+    if(sel_note>=note_vis_count) sel_note=note_vis_count>0?note_vis_count-1:0;
 }
 
 /* ------ timestamp ------ */
@@ -417,6 +750,347 @@ static int popup_needed_rows(const char *s, int field_w) {
         p += mb;
     }
     return rows;
+}
+
+/* ------ draw: word-wrap utf-8 text (with \n paragraphs) ------
+   draws into rows [row..max_row], columns [x..x+width).
+   *trunc is set if the source didn't fit. returns next free row. */
+static int draw_wrapped(WINDOW *w, int row, int max_row, int width, int x,
+                        const char *src, bool *trunc) {
+    int col = 0;
+    if (trunc) *trunc = false;
+    while (*src) {
+        if (*src == '\n') { row++; col = 0; src++; continue; }
+        if (row > max_row) { if (trunc) *trunc = true; break; }
+        wchar_t wc;
+        int mb = mbtowc(&wc, src, MB_CUR_MAX);
+        if (mb <= 0) { src++; continue; }
+        int wcw = wcwidth(wc); if (wcw < 0) wcw = 0;
+        if (col + wcw > width) { row++; col = 0; continue; }
+        char mb_buf[MB_CUR_MAX + 1];
+        memcpy(mb_buf, src, (size_t)mb);
+        mb_buf[mb] = '\0';
+        mvwprintw(w, row, x + col, "%s", mb_buf);
+        col += wcw;
+        src += mb;
+    }
+    return row;
+}
+
+/* ------ multiline editor (ported from pipboy's editor.cpp) ------ */
+typedef struct {
+    wchar_t lines[ML_LINES][ML_COLS];
+    int nlines;
+    int cur;
+    int col;
+    bool accepted;
+} MLEditor;
+
+static int ml_linelen(const MLEditor *e, int i) {
+    int len = 0;
+    while (len < ML_COLS && e->lines[i][len]) len++;
+    return len;
+}
+
+static void ml_init(MLEditor *e, const char *initial) {
+    memset(e, 0, sizeof *e);
+    int line = 0, colc = 0;
+    const char *p = initial;
+    while (*p && line < ML_LINES) {
+        if (*p == '\n') {
+            if (line + 1 < ML_LINES) { line++; colc = 0; }
+            p++;
+            continue;
+        }
+        wchar_t wc;
+        int mb = mbtowc(&wc, p, MB_CUR_MAX);
+        if (mb <= 0) { p++; continue; }
+        if (colc < ML_COLS) e->lines[line][colc++] = wc;
+        p += mb;
+    }
+    e->nlines = line + 1;
+    e->cur = line;
+    e->col = colc;
+    if (e->col > ml_linelen(e, e->cur)) e->col = ml_linelen(e, e->cur);
+}
+
+static void ml_serialize(const MLEditor *e, char *out, size_t n) {
+    size_t w = 0;
+    for (int i = 0; i < e->nlines && w + 1 < n; i++) {
+        if (i) out[w++] = '\n';
+        for (int c = 0; c < ML_COLS && e->lines[i][c] && w + 5 < n; c++) {
+            char tmp[4];
+            int tl = utf8_put((unsigned)e->lines[i][c], tmp);
+            memcpy(out + w, tmp, (size_t)tl);
+            w += (size_t)tl;
+        }
+    }
+    if (w < n) out[w] = '\0'; else out[n-1] = '\0';
+}
+
+static void ml_insert(MLEditor *e, wchar_t wc) {
+    int len = ml_linelen(e, e->cur);
+    if (len >= ML_COLS) return;
+    if (e->col > len) e->col = len;
+    for (int c = len; c > e->col; c--)
+        e->lines[e->cur][c] = e->lines[e->cur][c - 1];
+    e->lines[e->cur][e->col++] = wc;
+}
+
+static void ml_backspace(MLEditor *e) {
+    if (e->col > 0) {
+        for (int c = e->col - 1; c < ML_COLS - 1; c++)
+            e->lines[e->cur][c] = e->lines[e->cur][c + 1];
+        e->lines[e->cur][ML_COLS - 1] = 0;
+        e->col--;
+    } else if (e->cur > 0) {
+        int plen = ml_linelen(e, e->cur - 1);
+        int len  = ml_linelen(e, e->cur);
+        for (int c = 0; c < len && plen + c < ML_COLS - 1; c++)
+            e->lines[e->cur - 1][plen + c] = e->lines[e->cur][c];
+        for (int i = e->cur; i < e->nlines - 1; i++)
+            memcpy(e->lines[i], e->lines[i + 1], sizeof e->lines[0]);
+        memset(e->lines[e->nlines - 1], 0, sizeof e->lines[0]);
+        e->nlines--;
+        e->cur--;
+        e->col = plen;
+    }
+}
+
+static void ml_delete(MLEditor *e) {
+    int len = ml_linelen(e, e->cur);
+    if (e->col < len) {
+        for (int c = e->col; c < ML_COLS - 1; c++)
+            e->lines[e->cur][c] = e->lines[e->cur][c + 1];
+        e->lines[e->cur][ML_COLS - 1] = 0;
+    } else if (e->cur + 1 < e->nlines) {
+        int nlen = ml_linelen(e, e->cur + 1);
+        for (int c = 0; c < nlen && len + c < ML_COLS - 1; c++)
+            e->lines[e->cur][len + c] = e->lines[e->cur + 1][c];
+        for (int i = e->cur + 1; i < e->nlines - 1; i++)
+            memcpy(e->lines[i], e->lines[i + 1], sizeof e->lines[0]);
+        memset(e->lines[e->nlines - 1], 0, sizeof e->lines[0]);
+        e->nlines--;
+    }
+}
+
+static void ml_enter(MLEditor *e) {
+    if (e->nlines >= ML_LINES) return;
+    int len = ml_linelen(e, e->cur);
+    int tn = len - e->col;
+    if (tn < 0) tn = 0;
+    wchar_t tail[ML_COLS] = {0};
+    for (int c = 0; c < tn; c++) tail[c] = e->lines[e->cur][e->col + c];
+    for (int c = e->col; c < ML_COLS; c++) e->lines[e->cur][c] = 0;
+    for (int i = e->nlines; i > e->cur + 1; i--)
+        memcpy(e->lines[i], e->lines[i - 1], sizeof e->lines[0]);
+    memcpy(e->lines[e->cur + 1], tail, sizeof tail);
+    e->nlines++;
+    e->cur++;
+    e->col = 0;
+}
+
+static void ml_move(MLEditor *e, int dline, int dcol, bool to_edge) {
+    if (dline) {
+        int n = e->cur + dline;
+        if (n < 0) n = 0;
+        if (n >= e->nlines) n = e->nlines - 1;
+        e->cur = n;
+        int len = ml_linelen(e, e->cur);
+        if (to_edge)           e->col = dline > 0 ? 0 : len;
+        else if (e->col > len) e->col = len;
+    } else {
+        int len = ml_linelen(e, e->cur);
+        if (to_edge) e->col = dcol > 0 ? len : 0;
+        else {
+            e->col += dcol;
+            if (e->col < 0)   e->col = 0;
+            if (e->col > len) e->col = len;
+        }
+    }
+}
+
+static void ml_draw(MLEditor *e, WINDOW *win, int H, int W,
+                    const char *title, int scroll) {
+    (void)W;
+    werase(win);
+    wattron(win,COLOR_PAIR(C_BORDER)|A_BOLD); box(win,0,0); wattroff(win,COLOR_PAIR(C_BORDER)|A_BOLD);
+    wattron(win,COLOR_PAIR(C_TOPBAR)|A_BOLD); mvwprintw(win,0,2," %s ",title); wattroff(win,COLOR_PAIR(C_TOPBAR)|A_BOLD);
+    wattron(win,A_DIM);
+    mvwprintw(win,H-1,2," Enter:new line  Ctrl-G:save  Esc:cancel ");
+    wattroff(win,A_DIM);
+
+    int textTop = 2;
+    int maxVisible = H - 5;
+    for (int vi = scroll; vi < e->nlines && vi - scroll < maxVisible; vi++) {
+        int len = ml_linelen(e, vi);
+        wmove(win, textTop + (vi - scroll), 2);
+        if (vi == e->cur) {
+            wchar_t cur_ch = e->col < len ? e->lines[vi][e->col] : L' ';
+            if (e->col > 0) waddnwstr(win, e->lines[vi], e->col);
+            cchar_t cc;
+            setcchar(&cc, &cur_ch, A_REVERSE, 0, NULL);
+            wadd_wch(win, &cc);
+            if (len > e->col + 1)
+                waddnwstr(win, e->lines[vi] + e->col + 1, len - e->col - 1);
+        } else if (len > 0) {
+            waddwstr(win, e->lines[vi]);
+        }
+    }
+    /* scroll indicator */
+    if (e->nlines > maxVisible) {
+        wattron(win,A_DIM);
+        if (scroll > 0) mvwaddch(win, textTop, 0, (chtype)'^');
+        if (scroll + maxVisible < e->nlines) mvwaddch(win, H-2, 0, (chtype)'v');
+        wattroff(win,A_DIM);
+    }
+}
+
+static int popup_edit_ml(const char *title, char *out, size_t outlen) {
+    int rows, cols; getmaxyx(stdscr, rows, cols);
+    int pw = (cols < 74) ? cols - 4 : 74;
+    int ph = (rows < 16) ? rows - 2 : 14;
+    if (pw < 30 || ph < 8) return 0;
+    int px = (cols - pw) / 2;
+    int py = (rows - ph) / 2;
+    WINDOW *p = newwin(ph, pw, py, px);
+    if (!p) return 0;
+    keypad(p, TRUE);
+
+    MLEditor ed;
+    ml_init(&ed, out);
+    int scroll = 0;
+
+    bool cancelled = false;
+    for (;;) {
+        int maxVisible = ph - 5;
+        if (ed.cur < scroll) scroll = ed.cur;
+        if (ed.cur >= scroll + maxVisible) scroll = ed.cur - maxVisible + 1;
+        if (scroll < 0) scroll = 0;
+
+        ml_draw(&ed, p, ph, pw, title, scroll);
+        wmove(p, 2 + ed.cur - scroll, 2 + ed.col);
+        wrefresh(p);
+
+        wint_t ch;
+        int rc = get_wch(&ch);
+        if (rc == ERR) continue;
+        if (rc == KEY_CODE_YES) {
+            switch (ch) {
+            case KEY_UP:    ml_move(&ed,-1,0,false); break;
+            case KEY_DOWN:  ml_move(&ed, 1,0,false); break;
+            case KEY_LEFT:  ml_move(&ed,0,-1,false); break;
+            case KEY_RIGHT: ml_move(&ed,0, 1,false); break;
+            case KEY_HOME:  ml_move(&ed,0,-1,true);  break;
+            case KEY_END:   ml_move(&ed,0, 1,true);  break;
+            case KEY_PPAGE: ml_move(&ed,-(ML_LINES/2),0,false); break;
+            case KEY_NPAGE: ml_move(&ed, (ML_LINES/2),0,false); break;
+            case KEY_BACKSPACE: ml_backspace(&ed); break;
+            case KEY_DC:    ml_delete(&ed); break;
+            case KEY_F(2):  ed.accepted = true; break;
+            case KEY_MOUSE: { MEVENT ev; while (getmouse(&ev)==OK) {} } break;
+            case KEY_RESIZE: default: break;
+            }
+        } else {
+            switch (ch) {
+            case 27: cancelled = true; break;
+            case '\n': case '\r': ml_enter(&ed); break;
+            case 0x07: case 0x13: ed.accepted = true; break; /* Ctrl-G / Ctrl-S */
+            case '\b': case 127: ml_backspace(&ed); break;
+            default:
+                if (ch >= 32) ml_insert(&ed, (wchar_t)ch);
+                break;
+            }
+        }
+        if (ed.accepted || cancelled) break;
+    }
+
+    if (ed.accepted) ml_serialize(&ed, out, outlen);
+    delwin(p);
+    touchwin(stdscr); refresh();
+    return ed.accepted && !cancelled;
+}
+
+/* ------ read-only multiline viewer (ported from pipboy) ------ */
+static void view_multiline(const char *title, const char *text) {
+    static wchar_t lines[256][ML_COLS + 8];
+    int nlines = 0, colc = 0;
+    const char *p = text;
+    bool truncated = false;
+    while (*p) {
+        if (*p == '\n') {
+            if (nlines + 1 < 256) { nlines++; colc = 0; p++; continue; }
+            truncated = true; break;
+        }
+        wchar_t wc;
+        int mb = mbtowc(&wc, p, MB_CUR_MAX);
+        if (mb <= 0) { p++; continue; }
+        if (colc < ML_COLS + 7) lines[nlines][colc++] = wc;
+        p += mb;
+    }
+    nlines = (nlines < 256) ? nlines + 1 : 256;
+    if (truncated && nlines < 256) {
+        lines[nlines][0] = (wchar_t)0x2026; lines[nlines][1] = 0;
+        nlines++;
+    }
+    if (nlines < 1) nlines = 1;
+
+    int rows, cols; getmaxyx(stdscr, rows, cols);
+    int pw = (cols < 74) ? cols - 4 : 74;
+    int ph = (rows < 16) ? rows - 2 : 14;
+    if (pw < 30 || ph < 8) return;
+    int px = (cols - pw) / 2;
+    int py = (rows - ph) / 2;
+    WINDOW *w = newwin(ph, pw, py, px);
+    if (!w) return;
+    keypad(w, TRUE);
+
+    int innerH = ph - 3;
+    int top = 0;
+    for (;;) {
+        if (top > nlines - innerH) top = nlines - innerH;
+        if (top < 0) top = 0;
+
+        werase(w);
+        wattron(w,COLOR_PAIR(C_BORDER)|A_BOLD); box(w,0,0); wattroff(w,COLOR_PAIR(C_BORDER)|A_BOLD);
+        wattron(w,COLOR_PAIR(C_TOPBAR)|A_BOLD); mvwprintw(w,0,2," %s (view) ",title); wattroff(w,COLOR_PAIR(C_TOPBAR)|A_BOLD);
+        wattron(w,A_DIM);
+        mvwprintw(w,ph-1,2," line %d-%d of %d   j/k,PgUp/Dn  Esc close ",
+            top+1, top+innerH<nlines?top+innerH:nlines, nlines);
+        wattroff(w,A_DIM);
+        for (int i = 0; i < innerH && top + i < nlines; i++) {
+            int len = 0;
+            while (len < ML_COLS + 8 && lines[top + i][len]) len++;
+            if (len > 0) mvwaddnwstr(w, 1 + i, 2, lines[top + i], len);
+        }
+        if (top > 0)                 mvwaddch(w, 1, 0, (chtype)'^'|A_DIM);
+        if (top + innerH < nlines)   mvwaddch(w, ph-2, 0, (chtype)'v'|A_DIM);
+        wrefresh(w);
+
+        wint_t ch;
+        int rc = get_wch(&ch);
+        if (rc == ERR) continue;
+        if (rc == KEY_CODE_YES) {
+            switch (ch) {
+            case KEY_UP:   if (top > 0) top--; break;
+            case KEY_DOWN: if (top + innerH < nlines) top++; break;
+            case KEY_PPAGE: top -= innerH - 1; if (top < 0) top = 0; break;
+            case KEY_NPAGE: top += innerH - 1; break;
+            case KEY_HOME: top = 0; break;
+            case KEY_END:  top = nlines - innerH; break;
+            case KEY_MOUSE: { MEVENT ev; while (getmouse(&ev)==OK) {} } break;
+            case KEY_RESIZE: default: break;
+            }
+        } else if (ch == 27 || ch == '\n' || ch == '\r' || ch == 'q') {
+            break;
+        } else if (ch == 'k') {
+            if (top > 0) top--;
+        } else if (ch == 'j') {
+            if (top + innerH < nlines) top++;
+        }
+    }
+    delwin(w);
+    touchwin(stdscr); refresh();
 }
 
 
@@ -540,8 +1214,12 @@ static void draw_top(WINDOW *w,int cols){
     werase(w);
     wattron(w,COLOR_PAIR(C_TOPBAR)|A_BOLD);
     mvwprintw(w,0,0,"%*s",cols,"");
-    mvwprintw(w,0,2," =^..^=  meowdo ");
-    int cx=20;
+    char title[64];
+    snprintf(title,sizeof title," =^..^=  meowdo // %s(%d) ",
+        view==VIEW_TASKS?"TASKS":"NOTES",
+        view==VIEW_TASKS?todo_count:note_count);
+    mvwprintw(w,0,2,"%s",title);
+    int cx=2+(int)strlen(title)+1;
     if(filter_tag[0]){
         wattron(w,COLOR_PAIR(C_TAG1)|A_BOLD);
         mvwprintw(w,0,cx," #%s ",filter_tag); cx+=(int)strlen(filter_tag)+4;
@@ -567,12 +1245,20 @@ static void draw_sbar(WINDOW *w,int cols){
     werase(w);
     wattron(w,COLOR_PAIR(C_SBAR)|A_BOLD);
     mvwprintw(w,0,0,"%*s",cols,"");
-    if(cols>100)
-        mvwprintw(w,0,1," n:new  e:edit  Spc:done  p:pin  t:tag  d:del  D:del-all  /:search  0-6:filter  Esc:clear  q:quit");
+    if(view==VIEW_NOTES){
+        if(cols>84)
+            mvwprintw(w,0,1," n:new note  e/m:edit  Enter:open  v:view  d:del  D:del-all  /:search  Tab:tasks  q:quit");
+        else if(cols>60)
+            mvwprintw(w,0,1," n:new  e:edit  v:view  d:del  /:search  Tab:tasks  q:quit");
+        else
+            mvwprintw(w,0,1," n  e  v  d  D  /  Tab  q");
+    }
+    else if(cols>100)
+        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  p:pin  t:tag  d:del  D:del-all  /:search  0-6:filter  Tab:notes  q:quit");
     else if(cols>50)
-        mvwprintw(w,0,1," n:new  e:edit  Spc:done  d:del  D:all  /:search  q:quit");
+        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  d:del  D:all  /:search  Tab:notes  q:quit");
     else
-        mvwprintw(w,0,1," n  e  Spc  d  D  /  q");
+        mvwprintw(w,0,1," n  e  m  v  Spc  d  D  /  Tab  q");
     if(smsg[0]&&smsg_ttl>0){
         int slen=(int)strlen(smsg);
         if(cols-slen-2>2){
@@ -622,36 +1308,61 @@ static void draw_celebrate(int rows,int cols){
 /* ------ draw: left pane ------ */
 static void draw_left(WINDOW *w,int h,int lw,int top){
     if(!w) return;
+    const bool notes_view = (view==VIEW_NOTES);
+    const int  items      = notes_view ? note_vis_count : vis_count;
+    const int  cursel     = notes_view ? sel_note     : sel;
+
     werase(w);
     wattron(w,COLOR_PAIR(C_BORDER)|A_BOLD); box(w,0,0); wattroff(w,COLOR_PAIR(C_BORDER)|A_BOLD);
-    wattron(w,COLOR_PAIR(C_HDR)|A_BOLD);   mvwprintw(w,0,2,"[ TODO ]"); wattroff(w,COLOR_PAIR(C_HDR)|A_BOLD);
+    wattron(w,COLOR_PAIR(C_HDR)|A_BOLD);
+    mvwprintw(w,0,2,notes_view?"[ NOTES ]":"[ TODO ]");
+    wattroff(w,COLOR_PAIR(C_HDR)|A_BOLD);
 
-    /* " N left" label — only if it fits */
-    char leftlabel[20]; snprintf(leftlabel,sizeof leftlabel," %d left ",g_pend);
-    int llen=(int)strlen(leftlabel);
-    if(lw>llen+12){
-        wattron(w,COLOR_PAIR(C_PIN)|A_BOLD);
-        mvwprintw(w,0,lw-llen-1,"%s",leftlabel);
-        wattroff(w,COLOR_PAIR(C_PIN)|A_BOLD);
+    if(notes_view){
+        /* " N notes " label */
+        char nlabel[24]; snprintf(nlabel,sizeof nlabel," %d notes ",note_count);
+        int nlen=(int)strlen(nlabel);
+        if(lw>nlen+12){
+            wattron(w,COLOR_PAIR(C_PIN)|A_BOLD);
+            mvwprintw(w,0,lw-nlen-1,"%s",nlabel);
+            wattroff(w,COLOR_PAIR(C_PIN)|A_BOLD);
+        }
+    } else {
+        /* " N left" label — only if it fits */
+        char leftlabel[20]; snprintf(leftlabel,sizeof leftlabel," %d left ",g_pend);
+        int llen=(int)strlen(leftlabel);
+        if(lw>llen+12){
+            wattron(w,COLOR_PAIR(C_PIN)|A_BOLD);
+            mvwprintw(w,0,lw-llen-1,"%s",leftlabel);
+            wattroff(w,COLOR_PAIR(C_PIN)|A_BOLD);
+        }
+
+        /* progress bar — only if enough width */
+        int pbw = lw - 22;
+        if(pbw >= 4) draw_progress(w,1,2,pbw);
+
+        /* column header — only if wide enough */
+        if(lw > 20){
+            wattron(w,A_DIM); mvwprintw(w,2,2,"  [/] #tag        task"); wattroff(w,A_DIM);
+        }
     }
-
-    /* progress bar — only if enough width */
-    int pbw = lw - 22;
-    if(pbw >= 4) draw_progress(w,1,2,pbw);
-
-    /* column header — only if wide enough */
-    if(lw > 20){
-        wattron(w,A_DIM); mvwprintw(w,2,2,"  [/] #tag        task"); wattroff(w,A_DIM);
+    if(notes_view && lw > 20){
+        wattron(w,A_DIM); mvwprintw(w,2,2,"  notes                       "); wattroff(w,A_DIM);
     }
     wattron(w,COLOR_PAIR(C_BORDER)|A_DIM); mvwhline(w,3,1,ACS_HLINE,lw-2); wattroff(w,COLOR_PAIR(C_BORDER)|A_DIM);
 
     int area=h-LIST_Y0-1; if(area<1)area=1;
 
-    if(vis_count==0){
+    if(items==0){
         wattron(w,COLOR_PAIR(C_BONGO)|A_DIM);
         int ey=h/2;
-        mvwprintw(w,ey,  3,search[0]?"  no matches~ try again?":"  nothing yet! press n :3");
-        mvwprintw(w,ey+1,3,search[0]?"  press Esc to clear /   ":"  meowdo is waiting nya~ ");
+        if(notes_view){
+            mvwprintw(w,ey,  3,search[0]?"  no notes match~ try again?":"  no notes yet! press n :3");
+            mvwprintw(w,ey+1,3,search[0]?"  press Esc to clear /      ":"  jot something down nya~  ");
+        } else {
+            mvwprintw(w,ey,  3,search[0]?"  no matches~ try again?":"  nothing yet! press n :3");
+            mvwprintw(w,ey+1,3,search[0]?"  press Esc to clear /   ":"  meowdo is waiting nya~ ");
+        }
         wattroff(w,COLOR_PAIR(C_BONGO)|A_DIM);
         wnoutrefresh(w); return;
     }
@@ -662,7 +1373,7 @@ static void draw_left(WINDOW *w,int h,int lw,int top){
         mvwprintw(w,LIST_Y0-1,lw-5,"(^)");
         wattroff(w,COLOR_PAIR(C_SEARCH)|A_BOLD);
     }
-    if(top+area<vis_count){
+    if(top+area<items){
         wattron(w,COLOR_PAIR(C_SEARCH)|A_BOLD);
         mvwprintw(w,h-1,lw-5,"(v)");
         wattroff(w,COLOR_PAIR(C_SEARCH)|A_BOLD);
@@ -670,9 +1381,29 @@ static void draw_left(WINDOW *w,int h,int lw,int top){
 
     for(int i=0;i<area;i++){
         int vi=top+i, row=LIST_Y0+i;
-        if(vi>=vis_count){ mvwprintw(w,row,1,"%*s",lw-2,""); continue; }
+        if(vi>=items){ mvwprintw(w,row,1,"%*s",lw-2,""); continue; }
+        int is_sel=(vi==cursel);
+
+        if(notes_view){
+            Note *n=&notes[note_vis[vi]];
+            wattrset(w,A_NORMAL);
+            if(is_sel){
+                wattron(w,COLOR_PAIR(C_SEL)|A_BOLD);
+                mvwprintw(w,row,1,"%*s",lw-2,"");
+            }
+            wattron(w,is_sel?COLOR_PAIR(C_SEL)|A_BOLD:COLOR_PAIR(C_PEND)|A_BOLD);
+            mvwprintw(w,row,2,"  ");
+            int avail=lw-8; if(avail<1)avail=1;
+            char clipped[MAX_LINE];
+            int w_used=trunc_to_width(n->text,clipped,sizeof clipped,avail);
+            waddstr(w,clipped);
+            for(int p2=0;p2<avail-w_used;p2++) waddch(w,' ');
+            /* first line has a desc? show a hint marker */
+            wattrset(w,A_NORMAL);
+            continue;
+        }
+
         Todo *t=&todos[vis[vi]];
-        int is_sel=(vi==sel);
 
         wattrset(w,A_NORMAL);
         if(is_sel){
@@ -682,6 +1413,7 @@ static void draw_left(WINDOW *w,int h,int lw,int top){
 
         char mark=(t->pinned&&!t->done)?'*':' ';
         char box_ch=t->done?'x':' ';
+        char dmark=t->desc[0]?'|':' ';
         int col_attr;
         if      (is_sel)    col_attr=COLOR_PAIR(C_SEL)|A_BOLD;
         else if (t->done)   col_attr=COLOR_PAIR(C_DONE)|A_DIM;
@@ -696,6 +1428,13 @@ static void draw_left(WINDOW *w,int h,int lw,int top){
             if(!is_sel){wattrset(w,A_NORMAL);wattron(w,COLOR_PAIR(tc)|A_BOLD);}
             mvwprintw(w,row,tx,"#%.*s(%d)",5,t->tag,tcnt);
             tx+=9;
+        }
+
+        /* description indicator */
+        if(t->desc[0]&&lw>tx+2){
+            wattron(w,is_sel?COLOR_PAIR(C_SEL)|A_BOLD:COLOR_PAIR(C_BONGO)|A_DIM);
+            mvwprintw(w,row,tx,"%c",dmark);
+            tx+=2;
         }
 
         int avail=lw-tx-4; if(avail<1)avail=1;
@@ -777,47 +1516,52 @@ static void draw_right(WINDOW *w,int h,int rw){
         ty++;
     }
 
-    /* selected task detail */
-    if(vis_count>0&&sel<vis_count&&ty<h-3){
+    /* selected task detail / note detail */
+    if(view==VIEW_NOTES){
+        int nvis = note_vis_count;
+        if(nvis>0&&sel_note<nvis&&ty<h-3){
+            Note *n=&notes[note_vis[sel_note]];
+            wattron(w,COLOR_PAIR(C_BORDER)|A_DIM); mvwhline(w,ty,2,ACS_HLINE,ca); wattroff(w,COLOR_PAIR(C_BORDER)|A_DIM); ty++;
+            wattron(w,COLOR_PAIR(C_HDR)|A_BOLD); mvwprintw(w,ty++,2,"[ NOTE ]"); wattroff(w,COLOR_PAIR(C_HDR)|A_BOLD);
+
+            bool trunc=false;
+            wattron(w,COLOR_PAIR(C_PEND)|A_BOLD);
+            ty=draw_wrapped(w,ty,h-4,ca-2,3,n->text,&trunc)+1;
+            wattroff(w,COLOR_PAIR(C_PEND)|A_BOLD);
+            if(trunc&&ty<h-2){
+                wattron(w,A_DIM); mvwprintw(w,ty++,3,"… v: view full"); wattroff(w,A_DIM);
+            }
+            char tsbuf[32];
+            fmt_ts(n->created_at,tsbuf,(int)sizeof tsbuf);
+            if(ty<h-2){wattron(w,A_DIM); mvwprintw(w,ty++,3,"+ %s",tsbuf); wattroff(w,A_DIM);}
+        }
+    }
+    else if(vis_count>0&&sel<vis_count&&ty<h-3){
         Todo *t=&todos[vis[sel]];
         wattron(w,COLOR_PAIR(C_BORDER)|A_DIM); mvwhline(w,ty,2,ACS_HLINE,ca); wattroff(w,COLOR_PAIR(C_BORDER)|A_DIM); ty++;
         wattron(w,COLOR_PAIR(C_HDR)|A_BOLD); mvwprintw(w,ty++,2,"[ SELECTED ]"); wattroff(w,COLOR_PAIR(C_HDR)|A_BOLD);
-        
+
         /* word-wrap with multibyte safety and ellipsis for truncation */
-        const char *src=t->text;
-        while(*src && ty<h-3){
-            char line_buf[MAX_LINE];
-            int col_used=0, limit=ca-2;
-            
-            /* truncate line safely to display width */
-            char *dst=line_buf;
-            bool more_text=false;
-            while(*src && col_used<limit){
-                wchar_t wc;
-                int mb=mbtowc(&wc,src,MB_CUR_MAX);
-                if(mb<=0) break;
-                int wcw=wcwidth(wc); if(wcw<0) wcw=0;
-                if(col_used+wcw>limit){ more_text=true; break; }
-                memcpy(dst,src,(size_t)mb);
-                dst+=mb; src+=mb; col_used+=wcw;
+        bool trunc=false;
+        wattron(w,COLOR_PAIR(C_PEND)|A_BOLD);
+        ty=draw_wrapped(w,ty,h-4,ca-2,3,t->text,&trunc)+1;
+        wattroff(w,COLOR_PAIR(C_PEND)|A_BOLD);
+
+        /* description preview */
+        if(t->desc[0]&&ty<h-3){
+            bool dtrunc=false;
+            wattron(w,COLOR_PAIR(C_BORDER)|A_DIM); mvwhline(w,ty,2,ACS_HLINE,ca); wattroff(w,COLOR_PAIR(C_BORDER)|A_DIM); ty++;
+            wattron(w,COLOR_PAIR(C_HDR)|A_BOLD); mvwprintw(w,ty++,2,"[ DESC ]"); wattroff(w,COLOR_PAIR(C_HDR)|A_BOLD);
+            wattron(w,COLOR_PAIR(C_PEND)|A_DIM);
+            ty=draw_wrapped(w,ty,h-4,ca-2,3,t->desc,&dtrunc);
+            wattroff(w,COLOR_PAIR(C_PEND)|A_DIM);
+            if(dtrunc&&ty<h-2){
+                wattron(w,A_DIM); mvwprintw(w,ty++,3,"… v: view full"); wattroff(w,A_DIM);
+            } else if(!dtrunc&&ty<h-2){
+                ty++;   /* blank separator */
             }
-            *dst='\0';
-            
-            /* add ellipsis if text continues and we're at end of visible area */
-            if(more_text && ty>=h-4){
-                if(col_used>=2 && dst>line_buf){
-                    /* trim last char to make room for ellipsis */
-                    dst--;
-                    strcpy(dst,"…");
-                }
-            }
-            
-            wattron(w,COLOR_PAIR(C_PEND)|A_BOLD);
-            mvwaddch(w,ty,3,' ');  /* position cursor */
-            waddstr(w,line_buf);   /* add UTF-8 text safely */
-            wattroff(w,COLOR_PAIR(C_PEND)|A_BOLD);
-            ty++;
         }
+
         if(t->pinned&&ty<h-3){
             wattron(w,COLOR_PAIR(C_PIN)|A_DIM); mvwprintw(w,ty++,3,"* pinned"); wattroff(w,COLOR_PAIR(C_PIN)|A_DIM);
         }
@@ -877,8 +1621,20 @@ static bool alloc_windows(Windows *w, int rows, int cols, int lw, int rw, int ch
     }
 }
 
+/* edit the selected note with the multiline editor
+   (shared by e, m and Enter in the NOTES tab) */
+static void edit_selected_note(void) {
+    if(note_vis_count==0) return;
+    Note *n=&notes[note_vis[sel_note]];
+    if(popup_edit_ml("Edit note",n->text,MAX_NOTE)){
+        todos_save(); rebuild_note_vis(); set_smsg("note updated! nya~");
+    }
+    /* flush any queued input from editor interaction */
+    timeout(0); while(getch()!=ERR); timeout(-1);
+}
+
 static void print_version(void) {
-    printf("meowdo version 1.3.5\n");  
+    printf("meowdo version 1.4.0\n");
     printf("thanks for using meowdo :3\n");
     printf(" =^..^=  =^..^=  =^..^=\n");
 }
@@ -891,15 +1647,19 @@ static void print_help(void) {
     printf("  --version    Show version information\n");
     printf("  --help       Show this help message\n\n");
     printf("Keys:\n");
+    printf("  Tab          Switch between TASKS and NOTES\n");
     printf("  j/k          Navigate up/down\n");
     printf("  g/G          Jump to top/bottom\n");
-    printf("  n            New task\n");
-    printf("  e            Edit selected task\n");
+    printf("  n            New task / new note\n");
+    printf("  e            Edit selected task / note\n");
+    printf("  m            Edit task description; edit note in NOTES tab\n");
+    printf("  Enter        Open memo (edit if empty, view otherwise)\n");
+    printf("  v            View description / note full-screen\n");
     printf("  Space        Toggle done/not done\n");
     printf("  p            Toggle pin\n");
     printf("  t            Set/clear tag\n");
-    printf("  d            Delete selected task\n");
-    printf("  D            Delete ALL tasks\n");
+    printf("  d            Delete selected task / note\n");
+    printf("  D            Delete ALL tasks / notes\n");
     printf("  /            Search\n");
     printf("  Esc          Clear search + filter\n");
     printf("  1-6          Filter by tag\n");
@@ -967,7 +1727,9 @@ int main(int argc, char *argv[]){
     init_pair(C_BEAT,   COLOR_BLACK,   COLOR_YELLOW);
     init_pair(C_TITLE,  COLOR_BLACK,   COLOR_CYAN);
 
-    todos_load(); rebuild_vis(); rebuild_tag_cache();
+    if (!todos_load() && todos_import_legacy())
+        todos_save();   /* one-time migration from legacy todos.txt */
+    rebuild_vis(); rebuild_note_vis(); rebuild_tag_cache();
     erase(); refresh();
 
     int rows, cols; getmaxyx(stdscr, rows, cols);
@@ -1013,12 +1775,14 @@ int main(int argc, char *argv[]){
 
         int pane_w = (layout == LAYOUT_FULL) ? lw : cols;
         int area = ch - LIST_Y0 - 1; if(area<1)area=1;
-        if(sel<list_top)       list_top=sel;
-        if(sel>=list_top+area) list_top=sel-area+1;
-        if(list_top<0)         list_top=0;
+        int *top_p = (view==VIEW_TASKS) ? &list_top : &note_top;
+        int cursel = (view==VIEW_TASKS) ? sel : sel_note;
+        if(cursel<*top_p)       *top_p=cursel;
+        if(cursel>=*top_p+area) *top_p=cursel-area+1;
+        if(*top_p<0)            *top_p=0;
 
         draw_top (win.top,  cols);
-        draw_left(win.left, ch, pane_w, list_top);
+        draw_left(win.left, ch, pane_w, *top_p);
         if(layout == LAYOUT_FULL && win.rite)
             draw_right(win.rite, ch, rw);
         draw_sbar(win.sbar, cols);
@@ -1037,22 +1801,56 @@ int main(int argc, char *argv[]){
         switch(key){
         case 'q': running=false; break;
 
-        case KEY_UP:   case 'k': if(sel>0)           sel--; break;
-        case KEY_DOWN: case 'j': if(sel<vis_count-1) sel++; break;
-        case 'g': case KEY_HOME: sel=0; break;
-        case 'G': case KEY_END:  sel=vis_count>0?vis_count-1:0; break;
-        case KEY_NPAGE: sel+=area/2; if(sel>=vis_count) sel=vis_count>0?vis_count-1:0; break;
-        case KEY_PPAGE: sel-=area/2; if(sel<0) sel=0; break;
+        case '\t': case KEY_BTAB:
+            view = (view==VIEW_TASKS) ? VIEW_NOTES : VIEW_TASKS;
+            list_top=0; note_top=0;
+            if(view==VIEW_TASKS) rebuild_vis(); else rebuild_note_vis();
+            set_smsg(view==VIEW_TASKS?"tasks tab":"notes tab");
+            break;
+
+        case KEY_UP: case 'k':
+            if(view==VIEW_NOTES){ if(sel_note>0) sel_note--; }
+            else if(sel>0) sel--;
+            break;
+        case KEY_DOWN: case 'j':
+            if(view==VIEW_NOTES){ if(sel_note<note_vis_count-1) sel_note++; }
+            else if(sel<vis_count-1) sel++;
+            break;
+        case 'g': case KEY_HOME: if(view==VIEW_NOTES) sel_note=0; else sel=0; break;
+        case 'G': case KEY_END:
+            if(view==VIEW_NOTES) sel_note=note_vis_count>0?note_vis_count-1:0;
+            else                 sel=vis_count>0?vis_count-1:0;
+            break;
+        case KEY_NPAGE:
+            if(view==VIEW_NOTES){ sel_note+=area/2; if(sel_note>=note_vis_count) sel_note=note_vis_count>0?note_vis_count-1:0; }
+            else { sel+=area/2; if(sel>=vis_count) sel=vis_count>0?vis_count-1:0; }
+            break;
+        case KEY_PPAGE:
+            if(view==VIEW_NOTES){ sel_note-=area/2; if(sel_note<0) sel_note=0; }
+            else { sel-=area/2; if(sel<0) sel=0; }
+            break;
 
         case 'n':{
-            char buf[MAX_LINE]="";
-            if(popup("New task","what needs doing?",buf,(int)sizeof buf)&&todo_count<MAX_TODOS){
-                Todo *t=&todos[todo_count];
-                t->done=false;t->pinned=false;t->created_at=time(NULL);t->done_at=0;
-                snprintf(t->tag,  MAX_TAG,  "%s", filter_tag[0]?filter_tag:"none");
-                snprintf(t->text, MAX_LINE, "%s", buf);
-                todo_count++; todos_save(); rebuild_vis(); sel=vis_count-1;
-                set_smsg("task added! nya~");
+            if(view==VIEW_NOTES){
+                char buf[MAX_NOTE]="";
+                if(popup_edit_ml("New note",buf,sizeof buf)&&note_count<MAX_NOTES){
+                    Note *nt=&notes[note_count];
+                    snprintf(nt->text,MAX_NOTE,"%s",buf);
+                    nt->created_at=time(NULL);
+                    note_count++; todos_save(); rebuild_note_vis();
+                    sel_note=note_vis_count-1;
+                    set_smsg("note added! nya~");
+                }
+            } else {
+                char buf[MAX_LINE]="";
+                if(popup("New task","what needs doing?",buf,(int)sizeof buf)&&todo_count<MAX_TODOS){
+                    Todo *t=&todos[todo_count];
+                    t->done=false;t->pinned=false;t->created_at=time(NULL);t->done_at=0;
+                    snprintf(t->tag,  MAX_TAG,  "%s", filter_tag[0]?filter_tag:"none");
+                    snprintf(t->text, MAX_LINE, "%s", buf);
+                    todo_count++; todos_save(); rebuild_vis(); sel=vis_count-1;
+                    set_smsg("task added! nya~");
+                }
             }
             /* flush any queued input from popup interaction */
             timeout(0); while(getch()!=ERR); timeout(-1);
@@ -1060,21 +1858,78 @@ int main(int argc, char *argv[]){
         }
 
         case 'e':{
-            if(vis_count==0) break;
-            Todo *t=&todos[vis[sel]];
-            char buf[MAX_LINE];
-            snprintf(buf, MAX_LINE, "%s", t->text);
-            if(popup("Edit task","edit text  (Esc=cancel)",buf,(int)sizeof buf)){
-                snprintf(t->text, MAX_LINE, "%s", buf);
-                todos_save(); rebuild_vis(); set_smsg("task updated! nya~");
+            if(view==VIEW_NOTES){
+                edit_selected_note();
+            } else {
+                if(vis_count==0) break;
+                Todo *t=&todos[vis[sel]];
+                char buf[MAX_LINE];
+                snprintf(buf, MAX_LINE, "%s", t->text);
+                if(popup("Edit task","edit text  (Esc=cancel)",buf,(int)sizeof buf)){
+                    snprintf(t->text, MAX_LINE, "%s", buf);
+                    todos_save(); rebuild_vis(); set_smsg("task updated! nya~");
+                }
+                /* flush any queued input from popup interaction */
+                timeout(0); while(getch()!=ERR); timeout(-1);
             }
-            /* flush any queued input from popup interaction */
+            break;
+        }
+
+        case 'v':{
+            if(view==VIEW_NOTES){
+                if(note_vis_count==0) break;
+                Note *n=&notes[note_vis[sel_note]];
+                if(!n->text[0]) { set_smsg("empty note (press e to write)"); break; }
+                view_multiline("NOTE", n->text);
+            } else {
+                if(vis_count==0) break;
+                Todo *t=&todos[vis[sel]];
+                if(!t->desc[0]) { set_smsg("no description (press m to add)"); break; }
+                view_multiline("DESCRIPTION", t->desc);
+            }
+            /* flush any queued input from editor interaction */
+            timeout(0); while(getch()!=ERR); timeout(-1);
+            break;
+        }
+
+        case 'm':{
+            if(view==VIEW_NOTES){
+                edit_selected_note();
+            }
+            else if(view==VIEW_TASKS && vis_count>0){
+                Todo *t=&todos[vis[sel]];
+                if(popup_edit_ml("Task description",t->desc,sizeof t->desc)){
+                    todos_save(); set_smsg("description saved! nya~");
+                }
+                /* flush any queued input from editor interaction */
+                timeout(0); while(getch()!=ERR); timeout(-1);
+            }
+            break;
+        }
+
+        case '\n': case '\r': case KEY_ENTER:{
+            /* Enter opens the memo for the selected item:
+               edit if empty, view full-screen otherwise */
+            if(view==VIEW_NOTES){
+                if(note_vis_count==0) break;
+                Note *n=&notes[note_vis[sel_note]];
+                if(n->text[0]) view_multiline("NOTE", n->text);
+                else           edit_selected_note();
+            } else {
+                if(vis_count==0) break;
+                Todo *t=&todos[vis[sel]];
+                if(t->desc[0]) view_multiline("DESCRIPTION", t->desc);
+                else if(popup_edit_ml("Task description",t->desc,sizeof t->desc)){
+                    todos_save(); set_smsg("description saved! nya~");
+                }
+            }
+            /* flush any queued input from editor/viewer interaction */
             timeout(0); while(getch()!=ERR); timeout(-1);
             break;
         }
 
         case ' ':
-            if(vis_count>0){
+            if(view==VIEW_TASKS&&vis_count>0){
                 Todo *t=&todos[vis[sel]];
                 t->done=!t->done; t->done_at=t->done?time(NULL):0;
                 todos_save(); rebuild_vis();
@@ -1086,7 +1941,7 @@ int main(int argc, char *argv[]){
             break;
 
         case 'p':
-            if(vis_count>0){
+            if(view==VIEW_TASKS&&vis_count>0){
                 Todo *t=&todos[vis[sel]]; t->pinned=!t->pinned;
                 todos_save(); rebuild_vis();
                 set_smsg(t->pinned?"pinned! *":"unpinned~");
@@ -1094,7 +1949,7 @@ int main(int argc, char *argv[]){
             break;
 
         case 't':{
-            if(vis_count==0) break;
+            if(view==VIEW_TASKS&&vis_count==0) break;
             char hint[256]="enter tag (blank=clear)";
             if(utag_n>0){
                 int hpos=(int)snprintf(hint,sizeof hint,"existing: ");
@@ -1119,18 +1974,32 @@ int main(int argc, char *argv[]){
         }
 
         case 'd':{
-            if(vis_count==0) break;
-            char buf[8]="",pr[80];
-            snprintf(pr,sizeof pr,"delete \"%.40s\"? y/N",todos[vis[sel]].text);
-            popup(pr,"",buf,(int)sizeof buf);
-            if(buf[0]=='y'||buf[0]=='Y'){
-                int ti=vis[sel];
-                for(int i=ti;i<todo_count-1;i++) todos[i]=todos[i+1];
-                todo_count--; 
-                todos_save(); rebuild_vis();
-                /* adjust selection after visibility rebuild */
-                if(sel>=vis_count) sel=vis_count>0?vis_count-1:0;
-                set_smsg("deleted! poof~");
+            if(view==VIEW_NOTES){
+                if(note_vis_count==0) break;
+                char buf[8]="";
+                popup("delete this note? y/N","",buf,(int)sizeof buf);
+                if(buf[0]=='y'||buf[0]=='Y'){
+                    int ti=note_vis[sel_note];
+                    for(int i=ti;i<note_count-1;i++) notes[i]=notes[i+1];
+                    note_count--;
+                    todos_save(); rebuild_note_vis();
+                    if(sel_note>=note_vis_count) sel_note=note_vis_count>0?note_vis_count-1:0;
+                    set_smsg("deleted! poof~");
+                }
+            } else {
+                if(vis_count==0) break;
+                char buf[8]="",pr[80];
+                snprintf(pr,sizeof pr,"delete \"%.40s\"? y/N",todos[vis[sel]].text);
+                popup(pr,"",buf,(int)sizeof buf);
+                if(buf[0]=='y'||buf[0]=='Y'){
+                    int ti=vis[sel];
+                    for(int i=ti;i<todo_count-1;i++) todos[i]=todos[i+1];
+                    todo_count--;
+                    todos_save(); rebuild_vis();
+                    /* adjust selection after visibility rebuild */
+                    if(sel>=vis_count) sel=vis_count>0?vis_count-1:0;
+                    set_smsg("deleted! poof~");
+                }
             }
             /* flush any queued input from popup interaction */
             timeout(0); while(getch()!=ERR); timeout(-1);
@@ -1138,14 +2007,26 @@ int main(int argc, char *argv[]){
         }
 
         case 'D':{
-            if(todo_count==0) break;
-            char buf[8]="",pr[80];
-            snprintf(pr,sizeof pr,"delete ALL %d tasks? y/N",todo_count);
-            popup(pr,"!! THIS CANNOT BE UNDONE !!",buf,(int)sizeof buf);
-            if(buf[0]=='y'||buf[0]=='Y'){
-                todo_count=0; sel=0; list_top=0;
-                todos_save(); rebuild_vis(); mark_dirty();
-                set_smsg("clean slate! fresh start nya~");
+            if(view==VIEW_NOTES){
+                if(note_count==0) break;
+                char buf[8]="",pr[80];
+                snprintf(pr,sizeof pr,"delete ALL %d notes? y/N",note_count);
+                popup(pr,"!! THIS CANNOT BE UNDONE !!",buf,(int)sizeof buf);
+                if(buf[0]=='y'||buf[0]=='Y'){
+                    note_count=0; sel_note=0; note_top=0;
+                    todos_save(); rebuild_note_vis();
+                    set_smsg("clean slate! fresh start nya~");
+                }
+            } else {
+                if(todo_count==0) break;
+                char buf[8]="",pr[80];
+                snprintf(pr,sizeof pr,"delete ALL %d tasks? y/N",todo_count);
+                popup(pr,"!! THIS CANNOT BE UNDONE !!",buf,(int)sizeof buf);
+                if(buf[0]=='y'||buf[0]=='Y'){
+                    todo_count=0; sel=0; list_top=0;
+                    todos_save(); rebuild_vis(); mark_dirty();
+                    set_smsg("clean slate! fresh start nya~");
+                }
             }
             /* flush any queued input from popup interaction */
             timeout(0); while(getch()!=ERR); timeout(-1);
@@ -1157,7 +2038,8 @@ int main(int argc, char *argv[]){
             if(popup("Search","type to filter~",buf,(int)sizeof buf))
                 snprintf(search,sizeof search,"%s",buf);
             else search[0]='\0';
-            sel=0; list_top=0; rebuild_vis();
+            sel=0; list_top=0; sel_note=0; note_top=0;
+            rebuild_vis(); rebuild_note_vis();
             /* flush any queued input from popup interaction */
             timeout(0); while(getch()!=ERR); timeout(-1);
             break;
@@ -1165,20 +2047,25 @@ int main(int argc, char *argv[]){
 
         case 27:
             search[0]='\0'; filter_tag[0]='\0';
-            sel=0; list_top=0; rebuild_vis(); set_smsg("filters cleared~");
+            sel=0; list_top=0; sel_note=0; note_top=0;
+            rebuild_vis(); rebuild_note_vis(); set_smsg("filters cleared~");
             break;
 
         case '0':
-            filter_tag[0]='\0'; sel=0; list_top=0;
-            rebuild_vis(); set_smsg("showing all tasks");
+            if(view==VIEW_TASKS){
+                filter_tag[0]='\0'; sel=0; list_top=0;
+                rebuild_vis(); set_smsg("showing all tasks");
+            }
             break;
 
         case '1':case '2':case '3':case '4':case '5':case '6':{
-            int ti=key-'1';
-            if(ti<utag_n){
-                strncpy(filter_tag,utags[ti],MAX_TAG-1); filter_tag[MAX_TAG-1]='\0';
-                sel=0; list_top=0; rebuild_vis();
-                char m[64]; snprintf(m,sizeof m,"filter: #%s",filter_tag); set_smsg(m);
+            if(view==VIEW_TASKS){
+                int ti=key-'1';
+                if(ti<utag_n){
+                    strncpy(filter_tag,utags[ti],MAX_TAG-1); filter_tag[MAX_TAG-1]='\0';
+                    sel=0; list_top=0; rebuild_vis();
+                    char m[64]; snprintf(m,sizeof m,"filter: #%s",filter_tag); set_smsg(m);
+                }
             }
             break;
         }
@@ -1189,6 +2076,7 @@ int main(int argc, char *argv[]){
     }
 
     free(todo_path);
+    free(legacy_path);
     free_windows(&win);
     endwin();
     printf("bye bye~ =^..^=\n");
