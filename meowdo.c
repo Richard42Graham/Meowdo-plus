@@ -595,15 +595,19 @@ static int todos_import_legacy(void) {
 }
 
 /* ------ sort / filter ------ */
-static int todo_cmp(const void *a,const void *b){
-    const Todo *A=a,*B=b;
-    if(A->pinned!=B->pinned) return B->pinned?1:-1;
-    if(A->done  !=B->done)   return A->done  ?1:-1;
-    return 0;
+/* sort class: 0=pinned+pending  1=pinned+done  2=pending  3=done */
+static int todo_class(const Todo *t) {
+    return (t->pinned?0:2) + (t->done?1:0);
 }
 
 static void rebuild_vis(void) {
-    qsort(todos,(size_t)todo_count,sizeof(Todo),todo_cmp);
+    /* stable class sort — preserves manual (J/K) order within groups */
+    static Todo sorted[MAX_TODOS];
+    int n=0;
+    for(int c=0;c<4;c++)
+        for(int i=0;i<todo_count;i++)
+            if(todo_class(&todos[i])==c) sorted[n++]=todos[i];
+    memcpy(todos,sorted,(size_t)todo_count*sizeof(Todo));
     vis_count=0;
     char ndl[MAX_LINE]="";
     if (search[0]) {
@@ -1246,15 +1250,17 @@ static void draw_sbar(WINDOW *w,int cols){
     wattron(w,COLOR_PAIR(C_SBAR)|A_BOLD);
     mvwprintw(w,0,0,"%*s",cols,"");
     if(view==VIEW_NOTES){
-        if(cols>84)
-            mvwprintw(w,0,1," n:new note  e/m:edit  Enter:open  v:view  d:del  D:del-all  /:search  Tab:tasks  q:quit");
+        if(cols>96)
+            mvwprintw(w,0,1," n:new note  e/m:edit  Enter:open  J/K:move  d:del  D:del-all  /:search  Tab:tasks  q:quit");
         else if(cols>60)
             mvwprintw(w,0,1," n:new  e:edit  v:view  d:del  /:search  Tab:tasks  q:quit");
         else
             mvwprintw(w,0,1," n  e  v  d  D  /  Tab  q");
     }
+    else if(cols>124)
+        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  J/K:move  p:pin  t:tag  d:del  D:del-all  /:search  0-6:filter  Tab:notes  q:quit");
     else if(cols>100)
-        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  p:pin  t:tag  d:del  D:del-all  /:search  0-6:filter  Tab:notes  q:quit");
+        mvwprintw(w,0,1," n:new  e:edit  m:desc  Spc:done  J/K:move  t:tag  d:del  /:search  Tab:notes  q:quit");
     else if(cols>50)
         mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  d:del  D:all  /:search  Tab:notes  q:quit");
     else
@@ -1649,6 +1655,7 @@ static void print_help(void) {
     printf("Keys:\n");
     printf("  Tab          Switch between TASKS and NOTES\n");
     printf("  j/k          Navigate up/down\n");
+    printf("  J/K          Move selected task/note down/up\n");
     printf("  g/G          Jump to top/bottom\n");
     printf("  n            New task / new note\n");
     printf("  e            Edit selected task / note\n");
@@ -1829,6 +1836,36 @@ int main(int argc, char *argv[]){
             if(view==VIEW_NOTES){ sel_note-=area/2; if(sel_note<0) sel_note=0; }
             else { sel-=area/2; if(sel<0) sel=0; }
             break;
+
+        case 'J': case 'K':{
+            /* move the selected item down/up in the list */
+            int dir=(key=='J')?1:-1;
+            if(view==VIEW_NOTES){
+                if(note_vis_count<2) break;
+                int cur=sel_note, nxt=cur+dir;
+                if(nxt<0||nxt>=note_vis_count) break;
+                int a=note_vis[cur], b=note_vis[nxt];
+                Note nt=notes[a]; notes[a]=notes[b]; notes[b]=nt;
+                todos_save(); rebuild_note_vis();
+                sel_note=nxt;
+                set_smsg(dir>0?"moved down~":"moved up!");
+            } else {
+                if(vis_count<2) break;
+                int cur=sel, nxt=cur+dir;
+                if(nxt<0||nxt>=vis_count) break;
+                int a=vis[cur], b=vis[nxt];
+                /* can't reorder across the pinned/done groups */
+                if(todo_class(&todos[a])!=todo_class(&todos[b])){
+                    set_smsg("can't move past pinned/done~");
+                    break;
+                }
+                Todo tt=todos[a]; todos[a]=todos[b]; todos[b]=tt;
+                todos_save(); rebuild_vis();
+                sel=nxt;
+                set_smsg(dir>0?"moved down~":"moved up!");
+            }
+            break;
+        }
 
         case 'n':{
             if(view==VIEW_NOTES){

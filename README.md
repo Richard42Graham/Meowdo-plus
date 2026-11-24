@@ -120,6 +120,7 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
 | `Tab` | switch between TASKS and NOTES |
 | `j` / `↓` | move down |
 | `k` / `↑` | move up |
+| `J` / `K` | move selected task/note down / up |
 | `g` / `G` | jump to top / bottom |
 | `PgUp` / `PgDn` | page up / down |
 | `n` | new task / new note |
