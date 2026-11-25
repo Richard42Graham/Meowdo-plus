@@ -14,6 +14,7 @@ It runs in your terminal, supports tags, search, pinning, and saves everything i
 - **tasks** – add, edit, delete, mark done
 - **descriptions** – every task can have a multiline description (`m` to edit, `v` to view)
 - **notes** – a separate NOTES tab for free-form multiline notes (`Tab` to switch)
+- **scheduled** – hide tasks until their due time (press `S`); they live in a SCHEDULED tab and appear at the top of the list when due
 - **pinning** – keep important tasks on top
 - **tags** – assign tags, filter by 1–6, color-coded
 - **search** – live filtering with `/`
@@ -117,13 +118,13 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
 
 | Key | Action |
 |-----|--------|
-| `Tab` | switch between TASKS and NOTES |
+| `Tab` | cycle TASKS → NOTES → SCHEDULED (Shift-Tab back) |
 | `j` / `↓` | move down |
 | `k` / `↑` | move up |
 | `J` / `K` | move selected task/note down / up |
 | `g` / `G` | jump to top / bottom |
 | `PgUp` / `PgDn` | page up / down |
-| `n` | new task / new note |
+| `n` | new task / new note / new scheduled task |
 | `e` | edit selected task / note |
 | `m` | edit task description; edit note in NOTES tab |
 | `Enter` | open memo — edit if empty, view otherwise |
@@ -131,13 +132,33 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
 | `Space` | toggle done |
 | `p` | toggle pin |
 | `t` | set / clear tag |
+| `S` | schedule task (hidden until then) |
+| `u` | release scheduled task now |
 | `d` | delete selected task / note |
-| `D` | delete ALL tasks / notes |
+| `D` | delete ALL tasks / notes / scheduled |
 | `/` | search |
 | `Esc` | clear search + tag filter |
 | `1` … `6` | filter by tag (color-coded) |
 | `0` | show all tasks |
 | `q` | quit |
+
+## Scheduling tasks
+
+Press `S` on a task (or `n` in the SCHEDULED tab) and enter a time. Accepted
+formats:
+
+| Input | Meaning |
+|-------|---------|
+| `+30m`, `+2h`, `+3d`, `+1w` | relative from now (combinable: `+1d 2h`) |
+| `18:30` | today at 18:30 (tomorrow if already past) |
+| `today 18:30` / `tomorrow 09:00` | explicit day |
+| `2026-11-25` / `2026-11-25 09:00` | explicit date |
+
+Scheduled tasks are hidden from the TASKS list, search and tag filters; they
+live in the SCHEDULED tab (soonest first) with a countdown. When the time
+arrives they appear at the top of the TASKS list — the app checks the clock
+every 30 seconds while open, so no cron job or external script is needed.
+`u` releases a scheduled task immediately.
 
 ## Data Storage
 
@@ -154,7 +175,8 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
       "pinned": false, "done": false,
       "tag": "work", "text": "review PR",
       "desc": "multi\nline description",
-      "created": 1678896000, "done_at": 1678899600
+      "created": 1678896000, "done_at": 1678899600,
+      "sched_at": 0
     }
   ],
   "notes": [
@@ -162,6 +184,10 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
   ]
 }
 ```
+
+`sched_at` is a unix timestamp — while it is in the future the task is hidden
+in the SCHEDULED tab and only becomes visible in the TASKS list once the
+time has passed.
 
 ### Migrating from older versions
 

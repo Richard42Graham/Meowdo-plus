@@ -24,9 +24,10 @@
  * ------------------------------------------------------------------------------------------------------------------------------------------------------------------
  *
  * data: ~/.local/share/meowdo/meowdo.json
- * json: {"version":1,"tasks":[{"pinned","done","tag","text","desc","created","done_at"}],
+ * json: {"version":1,"tasks":[{"pinned","done","tag","text","desc","created","done_at","sched_at"}],
  *        "notes":[{"text","created"}]}
  * (legacy todos.txt pipe-format is auto-imported on first run)
+ * sched_at: tasks with sched_at > now are hidden until then (SCHEDULED tab)
  */
 
 #ifndef _XOPEN_SOURCE
@@ -44,6 +45,7 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include <wchar.h>
+#include <strings.h>
 
 /* ------ constants ------ */
 #define MAX_TODOS  1024
@@ -118,14 +120,18 @@ typedef struct {
     char   desc[MAX_DESC];
     time_t created_at;
     time_t done_at;
+    time_t sched_at;
 } Todo;
+
+/* a task is hidden while its schedule time is in the future */
+static bool is_hidden(const Todo *t);
 
 typedef struct {
     char   text[MAX_NOTE];
     time_t created_at;
 } Note;
 
-typedef enum { VIEW_TASKS, VIEW_NOTES } View;
+typedef enum { VIEW_TASKS, VIEW_NOTES, VIEW_SCHED } View;
 
 static Todo todos[MAX_TODOS];
 static int  todo_count = 0;
@@ -141,6 +147,10 @@ static int  vis_count  = 0;
 static int  note_vis[MAX_NOTES];
 static int  note_vis_count = 0;
 static int  note_top   = 0;
+static int  sched_vis[MAX_TODOS];
+static int  sched_vis_count = 0;
+static int  sel_sched = 0;
+static int  sched_top = 0;
 static char smsg[256]  = "";
 static int  smsg_ttl   = 0;
 static int  celebrate  = 0;
@@ -153,7 +163,7 @@ static int  utag_n     = 0;
 static int  tags_dirty = 1;
 
 /* frame-cached counts --- computed once per frame, not per draw call */
-static int  g_pend=0, g_done_c=0, g_pin_c=0;
+static int  g_pend=0, g_done_c=0, g_pin_c=0, g_sched_c=0;
 
 /* ------ helpers ------ */
 static int tag_color(const char *tag) {
@@ -253,6 +263,7 @@ static void rebuild_tag_cache(void) {
     utag_n=0;
     for (int i=0;i<todo_count;i++) {
         if (!todos[i].tag[0]||strcmp(todos[i].tag,"none")==0) continue;
+        if (is_hidden(&todos[i])) continue;
         int found=-1;
         for (int j=0;j<utag_n;j++)
             if (strcmp(utags[j],todos[i].tag)==0){found=j;break;}
@@ -271,10 +282,11 @@ static void rebuild_tag_cache(void) {
 }
 static void mark_dirty(void){ tags_dirty=1; }
 
-/* one pass to count pending/done/pinned */
+/* one pass to count pending/done/pinned/scheduled */
 static void recount(void) {
-    g_pend=0; g_done_c=0; g_pin_c=0;
+    g_pend=0; g_done_c=0; g_pin_c=0; g_sched_c=0;
     for (int i=0;i<todo_count;i++){
+        if(is_hidden(&todos[i])){ g_sched_c++; continue; }
         if(todos[i].done) g_done_c++; else g_pend++;
         if(todos[i].pinned) g_pin_c++;
     }
@@ -396,6 +408,16 @@ static long long jp_number(JParser *J) {
     long long v=strtoll(J->p,&end,10);
     if (end==J->p) return 0;
     J->p=end;
+    /* tolerate a fractional/exponent part (only integers are stored) */
+    if (*J->p=='.') {
+        J->p++;
+        while (*J->p>='0'&&*J->p<='9') J->p++;
+        if (*J->p=='e'||*J->p=='E'){
+            J->p++;
+            if (*J->p=='+'||*J->p=='-') J->p++;
+            while (*J->p>='0'&&*J->p<='9') J->p++;
+        }
+    }
     return v;
 }
 
@@ -456,6 +478,7 @@ static int jp_task_obj(JParser *J) {
         else if (!strcmp(key,"desc"))    jp_string(J,t.desc,MAX_DESC);
         else if (!strcmp(key,"created")) t.created_at=(time_t)jp_number(J);
         else if (!strcmp(key,"done_at")) t.done_at=(time_t)jp_number(J);
+        else if (!strcmp(key,"sched_at")) t.sched_at=(time_t)jp_number(J);
         else jp_skip_value(J);
     }
     if (todo_count<MAX_TODOS) todos[todo_count++]=t;
@@ -542,8 +565,8 @@ static void todos_save(void) {
         jw_string(f,t->tag[0]?t->tag:"none");
         fprintf(f,", \"text\": "); jw_string(f,t->text);
         fprintf(f,", \"desc\": ");  jw_string(f,t->desc);
-        fprintf(f,", \"created\": %ld, \"done_at\": %ld }%s\n",
-            (long)t->created_at,(long)t->done_at, i+1<todo_count?",":"");
+        fprintf(f,", \"created\": %ld, \"done_at\": %ld, \"sched_at\": %ld }%s\n",
+            (long)t->created_at,(long)t->done_at,(long)t->sched_at, i+1<todo_count?",":"");
     }
     fprintf(f," ],\n \"notes\": [\n");
     for (int i=0;i<note_count;i++){
@@ -569,6 +592,7 @@ static int todos_import_legacy(void) {
         Todo *t=&todos[todo_count];
         t->done_at=0;
         t->tag[0]='\0';t->text[0]='\0';t->desc[0]='\0';
+        t->sched_at=0;
         t->pinned=(line[0]=='P');
         t->done  =(line[2]=='x');
         char *p1=strchr(line+4,'|'); if(!p1) continue;
@@ -616,6 +640,7 @@ static void rebuild_vis(void) {
     }
     for(int i=0;i<todo_count;i++){
         Todo *t=&todos[i];
+        if(is_hidden(t)) continue;
         if(filter_tag[0]&&strcmp(t->tag,filter_tag)!=0) continue;
         if(search[0]){
             char hay[MAX_LINE];
@@ -650,12 +675,204 @@ static void rebuild_note_vis(void) {
     if(sel_note>=note_vis_count) sel_note=note_vis_count>0?note_vis_count-1:0;
 }
 
+static void rebuild_sched_vis(void) {
+    sched_vis_count=0;
+    char ndl[MAX_LINE]="";
+    if (search[0]) {
+        snprintf(ndl,sizeof ndl,"%s",search);
+        for(int j=0;ndl[j];j++) ndl[j]=(char)tolower((unsigned char)ndl[j]);
+    }
+    for(int i=0;i<todo_count;i++){
+        Todo *t=&todos[i];
+        if(!is_hidden(t)) continue;
+        if(search[0]){
+            char hay[MAX_LINE];
+            snprintf(hay,sizeof hay,"%s",t->text);
+            for(int j=0;hay[j];j++) hay[j]=(char)tolower((unsigned char)hay[j]);
+            if(!strstr(hay,ndl)) continue;
+        }
+        sched_vis[sched_vis_count++]=i;
+    }
+    /* soonest first: insertion sort by sched_at */
+    for(int a=1;a<sched_vis_count;a++){
+        int v=sched_vis[a], b=a-1;
+        while(b>=0 && todos[sched_vis[b]].sched_at>todos[v].sched_at){
+            sched_vis[b+1]=sched_vis[b]; b--;
+        }
+        sched_vis[b+1]=v;
+    }
+    if(sel_sched>=sched_vis_count) sel_sched=sched_vis_count>0?sched_vis_count-1:0;
+}
+
+/* move task to array position 0 (displayed at top of its sort group) */
+static void move_to_front(int i) {
+    Todo t=todos[i];
+    for (int k=i;k>0;k--) todos[k]=todos[k-1];
+    todos[0]=t;
+}
+
+/* reveal every task whose schedule time has arrived: move to the top
+   of the list (below pinned, which the class sort keeps above) and
+   clear sched_at. returns true if anything was revealed. */
+static bool process_reveals(void) {
+    time_t now=time(NULL);
+    int idx[MAX_TODOS], nidx=0;
+    for (int i=0;i<todo_count;i++)
+        if (todos[i].sched_at && todos[i].sched_at<=now) idx[nidx++]=i;
+    if (!nidx) return false;
+
+    /* sort revealed indices newest-first so that, when each is moved to
+       the front, the oldest ends up on top */
+    for (int a=0;a<nidx;a++)
+        for (int b=a+1;b<nidx;b++)
+            if (todos[idx[b]].sched_at>todos[idx[a]].sched_at){
+                int t=idx[a]; idx[a]=idx[b]; idx[b]=t;
+            }
+
+    static Todo scratch[MAX_TODOS];
+    static unsigned char taken[MAX_TODOS];
+    memset(taken,0,(size_t)todo_count);
+    for (int a=0;a<nidx;a++) taken[idx[a]]=1;
+
+    int n=0;
+    for (int a=nidx-1;a>=0;a--){          /* oldest first at the top */
+        scratch[n]=todos[idx[a]];
+        scratch[n].sched_at=0;
+        n++;
+    }
+    for (int i=0;i<todo_count;i++)
+        if (!taken[i]) scratch[n++]=todos[i];
+    memcpy(todos,scratch,(size_t)n*sizeof(Todo));
+    return true;
+}
+
 /* ------ timestamp ------ */
 static void fmt_ts(time_t ts,char *buf,int buflen){
     if(!ts){strncpy(buf,"-",(size_t)buflen);buf[buflen-1]='\0';return;}
     struct tm tmbuf; struct tm *tm=localtime_r(&ts,&tmbuf);
     if(tm) strftime(buf,(size_t)buflen,"%d %b %H:%M",tm);
     else   strncpy(buf,"?",(size_t)buflen);
+}
+
+/* short countdown until a future time, like "2d 3h" / "3h 20m" / "45m" */
+static void fmt_in(time_t when,char *buf,int buflen){
+    long long d=(long long)when-(long long)time(NULL);
+    if(d<0) d=0;
+    long long days=d/86400; d%=86400;
+    long long h=d/3600; d%=3600;
+    long long m=d/60;
+    if(days>0)      snprintf(buf,(size_t)buflen,"%lldd %lldh",days,h);
+    else if(h>0)    snprintf(buf,(size_t)buflen,"%lldh %lldm",h,m);
+    else            snprintf(buf,(size_t)buflen,"%lldm",m);
+}
+
+/* parseable date+time, "2026-11-25 09:00" (used for schedule popups) */
+static void fmt_ymd(time_t ts,char *buf,int buflen){
+    struct tm tmbuf; struct tm *tm=localtime_r(&ts,&tmbuf);
+    if(tm) strftime(buf,(size_t)buflen,"%Y-%m-%d %H:%M",tm);
+    else   strncpy(buf,"?",(size_t)buflen);
+}
+
+/* schedule popup hint showing the current date+time */
+static void sched_hint(char *buf,int buflen){
+    char nowbuf[32];
+    fmt_ymd(time(NULL),nowbuf,(int)sizeof nowbuf);
+    snprintf(buf,(size_t)buflen,"now %s | e.g. +2h | 09:00 | tomorrow 09:00",nowbuf);
+}
+
+/* a task is hidden while its schedule time is in the future */
+static bool is_hidden(const Todo *t){
+    return t->sched_at!=0 && t->sched_at>time(NULL);
+}
+
+/* ------ schedule time parsing ------
+   accepts:  +30m  +2h  +3d  +1w   (repeatable: "+1d 2h")
+             HH:MM                 (today, or tomorrow if already past)
+             [today|tomorrow] HH:MM
+             YYYY-MM-DD [HH:MM]
+   returns false (leaving *out untouched) on anything else.        */
+static bool parse_time_input(const char *s, time_t *out){
+    while (*s==' '||*s=='\t') s++;
+    if (!*s) return false;
+
+    time_t now=time(NULL);
+
+    /* relative offsets: +N(m|h|d|w), tokens combinable: "+1d 2h" */
+    if (*s=='+') {
+        long long total=0;
+        const char *p=s+1;
+        for(;;){
+            char *end;
+            long long n=strtoll(p,&end,10);
+            if (end==p||n<=0) return false;
+            p=end;
+            long long mult;
+            switch (tolower((unsigned char)*p)) {
+            case 'm': mult=60;     break;
+            case 'h': mult=3600;   break;
+            case 'd': mult=86400;  break;
+            case 'w': mult=604800; break;
+            default:  return false;
+            }
+            p++;
+            total+=n*mult;
+            while (*p==' '||*p=='\t') p++;
+            if (!*p){ *out=now+total; return true; }
+        }
+    }
+
+    struct tm base;
+    if (!localtime_r(&now,&base)) return false;
+    bool have_date=false;
+    int y=0,mo=0,dd=0,hh=-1,mm=-1;
+    const char *p=s;
+
+    if      (!strncasecmp(p,"today",5))    { p+=5; have_date=true; }
+    else if (!strncasecmp(p,"tomorrow",8)) { p+=8; base.tm_mday++; have_date=true; }
+    else {
+        int consumed=0;
+        if (sscanf(p,"%4d-%2d-%2d%n",&y,&mo,&dd,&consumed)==3 && consumed==10) {
+            base.tm_year=y-1900; base.tm_mon=mo-1; base.tm_mday=dd;
+            have_date=true; p+=consumed;
+        }
+    }
+    while (*p==' '||*p=='\t') p++;
+
+    if (*p) {                      /* HH:MM part */
+        int consumed=0;
+        if (sscanf(p,"%2d:%2d%n",&hh,&mm,&consumed)!=2) return false;
+        p+=consumed;
+        while (*p==' '||*p=='\t') p++;
+    }
+    if (*p) return false;          /* trailing junk */
+
+    if (hh<0){ hh=0; mm=0; }
+    if (mm<0) mm=0;
+    if (mo>12||dd>31||hh>23||mm>59) return false;
+    if ((mo||dd)&&(mo<1||dd<1)) return false;
+
+    struct tm target=base;
+    target.tm_hour=hh; target.tm_min=mm; target.tm_sec=0; target.tm_isdst=-1;
+    time_t when=mktime(&target);
+    if (when==(time_t)-1) return false;
+
+    /* reject non-existent dates (e.g. Feb 30) that mktime silently normalises */
+    if (have_date) {
+        struct tm chk;
+        if (!localtime_r(&when,&chk)) return false;
+        if (chk.tm_year!=base.tm_year || chk.tm_mon!=base.tm_mon || chk.tm_mday!=base.tm_mday)
+            return false;
+    }
+
+    if (!have_date && when<=now) {   /* bare HH:MM in the past -> tomorrow */
+        when+=86400;
+        if (!localtime_r(&when,&target)) return false;
+        target.tm_hour=hh; target.tm_min=mm; target.tm_sec=0; target.tm_isdst=-1;
+        when=mktime(&target);
+        if (when==(time_t)-1) return false;
+    }
+    *out=when;
+    return true;
 }
 
 /* ------ layout detection ------ */
@@ -684,7 +901,7 @@ static int trunc_to_width(const char *src, char *dst, int dst_size, int max_widt
 }
 
 static void popup_draw_field(WINDOW *win, int start_row, int max_row, int field_w,
-                             const char *s,
+                             const char *s, int cur_byte,
                              int *cur_row_out, int *cur_col_out)
 {
     /* clear only the valid field rows — never touch hint bar or border */
@@ -699,11 +916,14 @@ static void popup_draw_field(WINDOW *win, int start_row, int max_row, int field_
     int col = 5;          /* column after "> " */
     int col_used = 0;     /* display columns used on this line */
     const char *p = s;
+    int off = 0;          /* byte offset of next char */
+    bool cursor_set = (cur_byte == 0);
+    int crow = row, ccol = col;
 
     while (*p) {
         wchar_t wc;
         int mb = mbtowc(&wc, p, MB_CUR_MAX);
-        if (mb <= 0) { p++; continue; }   /* skip invalid bytes */
+        if (mb <= 0) { p++; off++; continue; }   /* skip invalid bytes */
 
         int wcw = wcwidth(wc);
         if (wcw < 0) wcw = 0;             /* non-printable -> 0 width */
@@ -723,6 +943,9 @@ static void popup_draw_field(WINDOW *win, int start_row, int max_row, int field_
             wattroff(win, COLOR_PAIR(C_PEND)|A_BOLD);
         }
 
+        /* record the screen position of the text cursor */
+        if (!cursor_set && off == cur_byte) { crow = row; ccol = col; cursor_set = true; }
+
         /* print the character */
         char mb_buf[MB_CUR_MAX + 1];
         memcpy(mb_buf, p, (size_t)mb);
@@ -734,10 +957,13 @@ static void popup_draw_field(WINDOW *win, int start_row, int max_row, int field_
         col      += wcw;
         col_used += wcw;
         p        += mb;
+        off      += mb;
     }
 
-    *cur_row_out = row;
-    *cur_col_out = col;
+    /* cursor at end of text */
+    if (!cursor_set) { crow = row; ccol = col; }
+    *cur_row_out = crow;
+    *cur_col_out = ccol;
 }
 
 static int popup_needed_rows(const char *s, int field_w) {
@@ -1098,13 +1324,19 @@ static void view_multiline(const char *title, const char *text) {
 }
 
 
-static int popup(const char *title, const char *hint, char *out, int maxlen){
+/* validation callback: return true to accept the input on Enter.
+   on false, errbuf receives a message shown inside the popup,
+   which stays open for correction. */
+typedef bool (*popup_validate_fn)(const char *input, void *udata, char *errbuf, int errsz);
+
+static int popup_impl(const char *title, const char *hint, char *out, int maxlen,
+                      popup_validate_fn val, void *udata){
     int rows, cols; getmaxyx(stdscr, rows, cols);
     int pw = (cols < 74) ? cols - 4 : 74;
     if (pw < 20 || rows < 9) return 0;
 
-    int field_w = pw - 7;   
-    
+    int field_w = pw - 7;
+
     #define PH_FOR(fr) ((fr) + 7)
 
     #define CLAMP_PH(ph) do { \
@@ -1120,6 +1352,9 @@ static int popup(const char *title, const char *hint, char *out, int maxlen){
     int px = (cols - pw) / 2;
     int py = rows/2 - ph/2;
     WINDOW *p = newwin(ph, pw, py, px); if (!p) return 0;
+    keypad(p, TRUE);           /* decode arrow keys (else ESC closes the popup) */
+
+    char errbuf[128] = "";
 
     /* full redraw: chrome + field, bottom bar always at ph-2 (inside border) */
     #define POPUP_REDRAW() do { \
@@ -1128,12 +1363,20 @@ static int popup(const char *title, const char *hint, char *out, int maxlen){
         wattron(p,COLOR_PAIR(C_TOPBAR)|A_BOLD); mvwprintw(p,0,2," %s ",title); wattroff(p,COLOR_PAIR(C_TOPBAR)|A_BOLD); \
         if(hint&&hint[0]){wattron(p,A_DIM); mvwprintw(p,2,3,"%.*s",pw-6,hint); wattroff(p,A_DIM);} \
         wattron(p,A_DIM); mvwprintw(p,ph-2,3," Enter:confirm   Esc:cancel "); wattroff(p,A_DIM); \
-        popup_draw_field(p, 4, ph-3, field_w, out, &cur_row, &cur_col); \
+        popup_draw_field(p, 4, ph-3, field_w, out, cur_byte, &cur_row, &cur_col); \
+        if(errbuf[0]){ \
+            int elen=(int)strlen(errbuf); \
+            int ex=(pw-2-elen)/2; if(ex<1)ex=1; \
+            wattron(p,COLOR_PAIR(C_PIN)|A_BOLD); \
+            mvwprintw(p,ph-3,ex,"%s",errbuf); \
+            wattroff(p,COLOR_PAIR(C_PIN)|A_BOLD); \
+        } \
     } while(0)
 
     curs_set(1);
     int len = (int)strnlen(out, (size_t)(maxlen-1));
     int cancelled = 0;
+    int cur_byte = len;        /* text cursor (byte offset) */
     int cur_row = 4, cur_col = 5;
 
     POPUP_REDRAW();
@@ -1141,27 +1384,103 @@ static int popup(const char *title, const char *hint, char *out, int maxlen){
 
     while (1) {
         int ch = wgetch(p);
-        if (ch == 27 || ch == KEY_F(1)) { out[0]='\0'; cancelled=1; break; }
-        if (ch == '\n' || ch == '\r') break;
-        
+        if (ch == KEY_F(1)) { out[0]='\0'; cancelled=1; break; }
+        if (ch == 27) {
+            /* bare Esc cancels; otherwise decode an escape sequence that
+               ncurses didn't match (e.g. normal-mode arrow keys) */
+            int c1 = ERR, c2 = ERR, c3 = ERR;
+            nodelay(p, TRUE);
+            c1 = wgetch(p);
+            if (c1 != ERR && (c1 == '[' || c1 == 'O')) {
+                c2 = wgetch(p);
+                if (c1 == '[' && c2 == '3') c3 = wgetch(p);
+            }
+            nodelay(p, FALSE);
+            if (c1 == ERR || c1 == 27) { out[0]='\0'; cancelled=1; break; }
+            if (c1 == 'O') {
+                if (c2=='C') ch = KEY_RIGHT;
+                else if (c2=='D') ch = KEY_LEFT;
+                else if (c2=='H') ch = KEY_HOME;
+                else if (c2=='F') ch = KEY_END;
+                else if (c2=='A') ch = KEY_UP;
+                else if (c2=='B') ch = KEY_DOWN;
+            } else if (c1 == '[') {
+                if (c2=='C') ch = KEY_RIGHT;
+                else if (c2=='D') ch = KEY_LEFT;
+                else if (c2=='A') ch = KEY_UP;
+                else if (c2=='B') ch = KEY_DOWN;
+                else if (c2=='H') ch = KEY_HOME;
+                else if (c2=='F') ch = KEY_END;
+                else if (c2=='3' && c3=='~') ch = KEY_DC;
+            }
+            if (ch == 27) {
+                /* unknown sequence: ignore and keep the popup open */
+                POPUP_REDRAW();
+                wmove(p, cur_row, cur_col); wrefresh(p);
+                continue;
+            }
+            /* decoded: fall through to normal key handling */
+        }
+        if (ch == '\n' || ch == '\r') {
+            if (val) {
+                if (len == 0) { out[0]='\0'; cancelled=1; break; }   /* blank = cancel */
+                if (!val(out, udata, errbuf, (int)sizeof errbuf)) {
+                    POPUP_REDRAW();                  /* stay open, show error */
+                    wmove(p, cur_row, cur_col); wrefresh(p);
+                    continue;
+                }
+            }
+            break;                     /* accept */
+        }
+
+        /* cursor movement within the field */
+        if (ch == KEY_LEFT && cur_byte > 0) {
+            cur_byte--;
+            while (cur_byte > 0 && ((unsigned char)out[cur_byte] & 0xC0) == 0x80)
+                cur_byte--;            /* stay on char boundaries */
+        }
+        else if (ch == KEY_RIGHT && cur_byte < len) {
+            cur_byte++;
+            while (cur_byte < len && ((unsigned char)out[cur_byte] & 0xC0) == 0x80)
+                cur_byte++;
+        }
+        else if (ch == KEY_HOME || ch == KEY_BEG) cur_byte = 0;
+        else if (ch == KEY_END)       cur_byte = len;
         /* ignore ONLY actual key codes (not ASCII chars) to prevent leaking to main loop */
-        if (ch == KEY_UP || ch == KEY_DOWN || ch == KEY_LEFT || ch == KEY_RIGHT ||
-            ch == KEY_HOME || ch == KEY_END || ch == KEY_PPAGE || ch == KEY_NPAGE) {
+        else if (ch == KEY_UP || ch == KEY_DOWN || ch == KEY_PPAGE || ch == KEY_NPAGE) {
             /* just redraw and keep waiting for valid input */
             POPUP_REDRAW();
             wmove(p, cur_row, cur_col); wrefresh(p);
             continue;
         }
 
-        if ((ch == KEY_BACKSPACE || ch == 127 || ch == '\b') && len > 0) {
-            /* walk back past UTF-8 continuation bytes (10xxxxxx) */
-            do { len--; } while (len > 0 && ((unsigned char)out[len] & 0xC0) == 0x80);
-            out[len] = '\0';
+        else if ((ch == KEY_BACKSPACE || ch == 127 || ch == '\b') && cur_byte > 0) {
+            /* delete the character before the cursor */
+            int i = cur_byte - 1;
+            while (i > 0 && ((unsigned char)out[i] & 0xC0) == 0x80) i--;
+            memmove(out + i, out + cur_byte, (size_t)(len - cur_byte + 1));
+            len -= cur_byte - i;
+            cur_byte = i;
+            errbuf[0]='\0';            /* new input: clear error */
+        }
+        else if (ch == KEY_DC && cur_byte < len) {
+            /* delete the character under the cursor */
+            int i = cur_byte + 1;
+            while (i < len && ((unsigned char)out[i] & 0xC0) == 0x80) i++;
+            memmove(out + cur_byte, out + i, (size_t)(len - i + 1));
+            len -= i - cur_byte;
+            errbuf[0]='\0';
         }
         /* accept printable ASCII and all UTF-8 continuation bytes (0x80+) */
         else if ((ch >= 32 && ch <= 126) || (ch & 0x80)) {
             if (len < maxlen-1) {
-                out[len++] = (char)ch; out[len] = '\0';
+                /* insert at the cursor, shifting the rest right */
+                memmove(out + cur_byte + 1, out + cur_byte, (size_t)(len - cur_byte));
+                out[cur_byte] = (char)ch;
+                cur_byte++;
+                len++;
+                out[len] = '\0';
+                errbuf[0]='\0';
             }
         }
 
@@ -1188,6 +1507,22 @@ static int popup(const char *title, const char *hint, char *out, int maxlen){
     #undef CLAMP_PH
     curs_set(0); delwin(p); touchwin(stdscr); refresh();
     return (!cancelled && len > 0);
+}
+
+static int popup(const char *title, const char *hint, char *out, int maxlen){
+    return popup_impl(title, hint, out, maxlen, NULL, NULL);
+}
+
+/* validator for schedule-time popups: parses and range-checks the input,
+   writes an inline error message when invalid */
+typedef struct { time_t when; } SchedVal;
+
+static bool validate_sched_time(const char *in, void *ud, char *errbuf, int errsz){
+    SchedVal *sv=(SchedVal*)ud;
+    if (!in[0]) { snprintf(errbuf,(size_t)errsz,"! enter a time (Esc cancels)"); return false; }
+    if (!parse_time_input(in,&sv->when)) { snprintf(errbuf,(size_t)errsz,"! can't parse that time"); return false; }
+    if (sv->when<=time(NULL))            { snprintf(errbuf,(size_t)errsz,"! that time already passed"); return false; }
+    return true;
 }
 
 /* ------ draw: too small overlay ------ */
@@ -1219,9 +1554,9 @@ static void draw_top(WINDOW *w,int cols){
     wattron(w,COLOR_PAIR(C_TOPBAR)|A_BOLD);
     mvwprintw(w,0,0,"%*s",cols,"");
     char title[64];
-    snprintf(title,sizeof title," =^..^=  meowdo // %s(%d) ",
-        view==VIEW_TASKS?"TASKS":"NOTES",
-        view==VIEW_TASKS?todo_count:note_count);
+    const char *tabname = (view==VIEW_TASKS)?"TASKS":(view==VIEW_NOTES)?"NOTES":"SCHED";
+    snprintf(title,sizeof title," =^..^=  meowdo // %s(%d) ",tabname,
+        view==VIEW_TASKS?todo_count:(view==VIEW_NOTES?note_count:g_sched_c));
     mvwprintw(w,0,2,"%s",title);
     int cx=2+(int)strlen(title)+1;
     if(filter_tag[0]){
@@ -1249,7 +1584,15 @@ static void draw_sbar(WINDOW *w,int cols){
     werase(w);
     wattron(w,COLOR_PAIR(C_SBAR)|A_BOLD);
     mvwprintw(w,0,0,"%*s",cols,"");
-    if(view==VIEW_NOTES){
+    if(view==VIEW_SCHED){
+        if(cols>100)
+            mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  S:resched  u:release  d:del  D:del-all  /:search  Tab:next  q:quit");
+        else if(cols>50)
+            mvwprintw(w,0,1," n  e  m  v  S  u  d  D  /  Tab  q");
+        else
+            mvwprintw(w,0,1," n  e  S  u  d  q");
+    }
+    else if(view==VIEW_NOTES){
         if(cols>96)
             mvwprintw(w,0,1," n:new note  e/m:edit  Enter:open  J/K:move  d:del  D:del-all  /:search  Tab:tasks  q:quit");
         else if(cols>60)
@@ -1258,9 +1601,9 @@ static void draw_sbar(WINDOW *w,int cols){
             mvwprintw(w,0,1," n  e  v  d  D  /  Tab  q");
     }
     else if(cols>124)
-        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  J/K:move  p:pin  t:tag  d:del  D:del-all  /:search  0-6:filter  Tab:notes  q:quit");
+        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  J/K:move  p:pin  t:tag  S:sched  d:del  D:del-all  /:search  Tab:notes  q:quit");
     else if(cols>100)
-        mvwprintw(w,0,1," n:new  e:edit  m:desc  Spc:done  J/K:move  t:tag  d:del  /:search  Tab:notes  q:quit");
+        mvwprintw(w,0,1," n:new  e:edit  m:desc  Spc:done  J/K:move  S:sched  d:del  /:search  Tab:notes  q:quit");
     else if(cols>50)
         mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  d:del  D:all  /:search  Tab:notes  q:quit");
     else
@@ -1315,16 +1658,31 @@ static void draw_celebrate(int rows,int cols){
 static void draw_left(WINDOW *w,int h,int lw,int top){
     if(!w) return;
     const bool notes_view = (view==VIEW_NOTES);
-    const int  items      = notes_view ? note_vis_count : vis_count;
-    const int  cursel     = notes_view ? sel_note     : sel;
+    const bool sched_view = (view==VIEW_SCHED);
+    const int  items      = notes_view ? note_vis_count
+                          : sched_view ? sched_vis_count : vis_count;
+    const int  cursel     = notes_view ? sel_note
+                          : sched_view ? sel_sched    : sel;
 
     werase(w);
     wattron(w,COLOR_PAIR(C_BORDER)|A_BOLD); box(w,0,0); wattroff(w,COLOR_PAIR(C_BORDER)|A_BOLD);
     wattron(w,COLOR_PAIR(C_HDR)|A_BOLD);
-    mvwprintw(w,0,2,notes_view?"[ NOTES ]":"[ TODO ]");
+    mvwprintw(w,0,2,sched_view?"[ SCHEDULED ]":notes_view?"[ NOTES ]":"[ TODO ]");
     wattroff(w,COLOR_PAIR(C_HDR)|A_BOLD);
 
-    if(notes_view){
+    if(sched_view){
+        /* " N waiting " label */
+        char slabel[24]; snprintf(slabel,sizeof slabel," %d waiting ",g_sched_c);
+        int slen=(int)strlen(slabel);
+        if(lw>slen+12){
+            wattron(w,COLOR_PAIR(C_PIN)|A_BOLD);
+            mvwprintw(w,0,lw-slen-1,"%s",slabel);
+            wattroff(w,COLOR_PAIR(C_PIN)|A_BOLD);
+        }
+        if(lw > 20){
+            wattron(w,A_DIM); mvwprintw(w,2,2,"  due          task"); wattroff(w,A_DIM);
+        }
+    } else if(notes_view){
         /* " N notes " label */
         char nlabel[24]; snprintf(nlabel,sizeof nlabel," %d notes ",note_count);
         int nlen=(int)strlen(nlabel);
@@ -1362,7 +1720,10 @@ static void draw_left(WINDOW *w,int h,int lw,int top){
     if(items==0){
         wattron(w,COLOR_PAIR(C_BONGO)|A_DIM);
         int ey=h/2;
-        if(notes_view){
+        if(sched_view){
+            mvwprintw(w,ey,  3,search[0]?"  nothing scheduled~ try again?":"  nothing scheduled! press n :3");
+            mvwprintw(w,ey+1,3,search[0]?"  press Esc to clear /     ":"  press S on a task to schedule it~");
+        } else if(notes_view){
             mvwprintw(w,ey,  3,search[0]?"  no notes match~ try again?":"  no notes yet! press n :3");
             mvwprintw(w,ey+1,3,search[0]?"  press Esc to clear /      ":"  jot something down nya~  ");
         } else {
@@ -1389,6 +1750,27 @@ static void draw_left(WINDOW *w,int h,int lw,int top){
         int vi=top+i, row=LIST_Y0+i;
         if(vi>=items){ mvwprintw(w,row,1,"%*s",lw-2,""); continue; }
         int is_sel=(vi==cursel);
+
+        if(sched_view){
+            Todo *t=&todos[sched_vis[vi]];
+            wattrset(w,A_NORMAL);
+            if(is_sel){
+                wattron(w,COLOR_PAIR(C_SEL)|A_BOLD);
+                mvwprintw(w,row,1,"%*s",lw-2,"");
+            }
+            wattron(w,is_sel?COLOR_PAIR(C_SEL)|A_BOLD:COLOR_PAIR(C_BONGO)|A_BOLD);
+            char cd[32];
+            fmt_in(t->sched_at,cd,(int)sizeof cd);
+            mvwprintw(w,row,2,"%9s ",cd);
+            int avail=lw-14; if(avail<1)avail=1;
+            wattron(w,is_sel?COLOR_PAIR(C_SEL)|A_BOLD:COLOR_PAIR(C_PEND)|A_BOLD);
+            char clipped[MAX_LINE];
+            int w_used=trunc_to_width(t->text,clipped,sizeof clipped,avail);
+            waddstr(w,clipped);
+            for(int p2=0;p2<avail-w_used;p2++) waddch(w,' ');
+            wattrset(w,A_NORMAL);
+            continue;
+        }
 
         if(notes_view){
             Note *n=&notes[note_vis[vi]];
@@ -1523,7 +1905,46 @@ static void draw_right(WINDOW *w,int h,int rw){
     }
 
     /* selected task detail / note detail */
-    if(view==VIEW_NOTES){
+    if(view==VIEW_SCHED){
+        int svis = sched_vis_count;
+        if(svis>0&&sel_sched<svis&&ty<h-3){
+            Todo *t=&todos[sched_vis[sel_sched]];
+            wattron(w,COLOR_PAIR(C_BORDER)|A_DIM); mvwhline(w,ty,2,ACS_HLINE,ca); wattroff(w,COLOR_PAIR(C_BORDER)|A_DIM); ty++;
+            wattron(w,COLOR_PAIR(C_HDR)|A_BOLD); mvwprintw(w,ty++,2,"[ SCHEDULED ]"); wattroff(w,COLOR_PAIR(C_HDR)|A_BOLD);
+
+            bool trunc=false;
+            wattron(w,COLOR_PAIR(C_PEND)|A_BOLD);
+            ty=draw_wrapped(w,ty,h-4,ca-2,3,t->text,&trunc)+1;
+            wattroff(w,COLOR_PAIR(C_PEND)|A_BOLD);
+
+            /* description preview */
+            if(t->desc[0]&&ty<h-3){
+                bool dtrunc=false;
+                wattron(w,COLOR_PAIR(C_HDR)|A_BOLD); mvwprintw(w,ty++,2,"[ DESC ]"); wattroff(w,COLOR_PAIR(C_HDR)|A_BOLD);
+                wattron(w,COLOR_PAIR(C_PEND)|A_DIM);
+                ty=draw_wrapped(w,ty,h-4,ca-2,3,t->desc,&dtrunc);
+                wattroff(w,COLOR_PAIR(C_PEND)|A_DIM);
+                if(dtrunc&&ty<h-2){
+                    wattron(w,A_DIM); mvwprintw(w,ty++,3,"… v: view full"); wattroff(w,A_DIM);
+                } else if(!dtrunc&&ty<h-2){
+                    ty++;
+                }
+            }
+
+            char tsbuf[32], cdbuf[16];
+            fmt_ts(t->sched_at,tsbuf,(int)sizeof tsbuf);
+            fmt_in(t->sched_at,cdbuf,(int)sizeof cdbuf);
+            if(ty<h-2){
+                wattron(w,COLOR_PAIR(C_PIN)|A_BOLD);
+                mvwprintw(w,ty++,3,"-> %s  (in %s)",tsbuf,cdbuf);
+                wattroff(w,COLOR_PAIR(C_PIN)|A_BOLD);
+            }
+            fmt_ts(t->created_at,tsbuf,(int)sizeof tsbuf);
+            if(ty<h-2){wattron(w,A_DIM); mvwprintw(w,ty++,3,"+ %s",tsbuf); wattroff(w,A_DIM);}
+            if(ty<h-2){wattron(w,A_DIM); mvwprintw(w,ty++,3,"u: release now"); wattroff(w,A_DIM);}
+        }
+    }
+    else if(view==VIEW_NOTES){
         int nvis = note_vis_count;
         if(nvis>0&&sel_note<nvis&&ty<h-3){
             Note *n=&notes[note_vis[sel_note]];
@@ -1640,7 +2061,7 @@ static void edit_selected_note(void) {
 }
 
 static void print_version(void) {
-    printf("meowdo version 1.4.0\n");
+    printf("meowdo version 1.5.0\n");
     printf("thanks for using meowdo :3\n");
     printf(" =^..^=  =^..^=  =^..^=\n");
 }
@@ -1653,11 +2074,11 @@ static void print_help(void) {
     printf("  --version    Show version information\n");
     printf("  --help       Show this help message\n\n");
     printf("Keys:\n");
-    printf("  Tab          Switch between TASKS and NOTES\n");
+    printf("  Tab          Cycle TASKS / NOTES / SCHEDULED (Shift-Tab back)\n");
     printf("  j/k          Navigate up/down\n");
     printf("  J/K          Move selected task/note down/up\n");
     printf("  g/G          Jump to top/bottom\n");
-    printf("  n            New task / new note\n");
+    printf("  n            New task / new note / new scheduled task\n");
     printf("  e            Edit selected task / note\n");
     printf("  m            Edit task description; edit note in NOTES tab\n");
     printf("  Enter        Open memo (edit if empty, view otherwise)\n");
@@ -1665,8 +2086,10 @@ static void print_help(void) {
     printf("  Space        Toggle done/not done\n");
     printf("  p            Toggle pin\n");
     printf("  t            Set/clear tag\n");
+    printf("  S            Schedule task (hidden until then)\n");
+    printf("  u            Release scheduled task now\n");
     printf("  d            Delete selected task / note\n");
-    printf("  D            Delete ALL tasks / notes\n");
+    printf("  D            Delete ALL tasks / notes / scheduled\n");
     printf("  /            Search\n");
     printf("  Esc          Clear search + filter\n");
     printf("  1-6          Filter by tag\n");
@@ -1703,6 +2126,7 @@ int main(int argc, char *argv[]){
     }
 
     setlocale(LC_ALL,"");
+    setenv("ESCDELAY","25",0);   /* snappy Esc detection (respects user env) */
     g_utf8 = detect_utf8();
     BONGO   = g_utf8 ? BONGO_UTF8 : BONGO_ASCII;
     build_paths();
@@ -1736,7 +2160,8 @@ int main(int argc, char *argv[]){
 
     if (!todos_load() && todos_import_legacy())
         todos_save();   /* one-time migration from legacy todos.txt */
-    rebuild_vis(); rebuild_note_vis(); rebuild_tag_cache();
+    if (process_reveals()) todos_save();   /* reveal anything already due */
+    rebuild_vis(); rebuild_note_vis(); rebuild_sched_vis(); rebuild_tag_cache();
     erase(); refresh();
 
     int rows, cols; getmaxyx(stdscr, rows, cols);
@@ -1778,12 +2203,19 @@ int main(int argc, char *argv[]){
         }
 
         if(tags_dirty) rebuild_tag_cache();
+        if(process_reveals()){
+            todos_save();
+            rebuild_vis(); rebuild_sched_vis();
+            set_smsg("scheduled task arrived! nya~");
+        }
         recount();
 
         int pane_w = (layout == LAYOUT_FULL) ? lw : cols;
         int area = ch - LIST_Y0 - 1; if(area<1)area=1;
-        int *top_p = (view==VIEW_TASKS) ? &list_top : &note_top;
-        int cursel = (view==VIEW_TASKS) ? sel : sel_note;
+        int *top_p = (view==VIEW_TASKS) ? &list_top
+                   : (view==VIEW_NOTES) ? &note_top : &sched_top;
+        int cursel = (view==VIEW_TASKS) ? sel
+                   : (view==VIEW_NOTES) ? sel_note : sel_sched;
         if(cursel<*top_p)       *top_p=cursel;
         if(cursel>=*top_p+area) *top_p=cursel-area+1;
         if(*top_p<0)            *top_p=0;
@@ -1798,7 +2230,8 @@ int main(int argc, char *argv[]){
 
         doupdate();
 
-        timeout(celebrate>0 ? 150 : -1);
+        /* wake up every 30s so scheduled tasks appear on time */
+        timeout(celebrate>0 ? 150 : 30000);
         if(smsg_ttl>0) smsg_ttl--;
 
         int key=getch();
@@ -1809,37 +2242,49 @@ int main(int argc, char *argv[]){
         case 'q': running=false; break;
 
         case '\t': case KEY_BTAB:
-            view = (view==VIEW_TASKS) ? VIEW_NOTES : VIEW_TASKS;
-            list_top=0; note_top=0;
-            if(view==VIEW_TASKS) rebuild_vis(); else rebuild_note_vis();
-            set_smsg(view==VIEW_TASKS?"tasks tab":"notes tab");
+            view = (View)(((int)view + ((key=='\t')?1:2)) % 3);
+            list_top=0; note_top=0; sched_top=0;
+            if(view==VIEW_TASKS)      rebuild_vis();
+            else if(view==VIEW_NOTES) rebuild_note_vis();
+            else                      rebuild_sched_vis();
+            set_smsg(view==VIEW_TASKS?"tasks tab":(view==VIEW_NOTES?"notes tab":"scheduled tab"));
             break;
 
         case KEY_UP: case 'k':
-            if(view==VIEW_NOTES){ if(sel_note>0) sel_note--; }
+            if(view==VIEW_SCHED){ if(sel_sched>0) sel_sched--; }
+            else if(view==VIEW_NOTES){ if(sel_note>0) sel_note--; }
             else if(sel>0) sel--;
             break;
         case KEY_DOWN: case 'j':
-            if(view==VIEW_NOTES){ if(sel_note<note_vis_count-1) sel_note++; }
+            if(view==VIEW_SCHED){ if(sel_sched<sched_vis_count-1) sel_sched++; }
+            else if(view==VIEW_NOTES){ if(sel_note<note_vis_count-1) sel_note++; }
             else if(sel<vis_count-1) sel++;
             break;
-        case 'g': case KEY_HOME: if(view==VIEW_NOTES) sel_note=0; else sel=0; break;
+        case 'g': case KEY_HOME:
+            if(view==VIEW_SCHED) sel_sched=0;
+            else if(view==VIEW_NOTES) sel_note=0;
+            else sel=0;
+            break;
         case 'G': case KEY_END:
-            if(view==VIEW_NOTES) sel_note=note_vis_count>0?note_vis_count-1:0;
-            else                 sel=vis_count>0?vis_count-1:0;
+            if(view==VIEW_SCHED) sel_sched=sched_vis_count>0?sched_vis_count-1:0;
+            else if(view==VIEW_NOTES) sel_note=note_vis_count>0?note_vis_count-1:0;
+            else sel=vis_count>0?vis_count-1:0;
             break;
         case KEY_NPAGE:
-            if(view==VIEW_NOTES){ sel_note+=area/2; if(sel_note>=note_vis_count) sel_note=note_vis_count>0?note_vis_count-1:0; }
+            if(view==VIEW_SCHED){ sel_sched+=area/2; if(sel_sched>=sched_vis_count) sel_sched=sched_vis_count>0?sched_vis_count-1:0; }
+            else if(view==VIEW_NOTES){ sel_note+=area/2; if(sel_note>=note_vis_count) sel_note=note_vis_count>0?note_vis_count-1:0; }
             else { sel+=area/2; if(sel>=vis_count) sel=vis_count>0?vis_count-1:0; }
             break;
         case KEY_PPAGE:
-            if(view==VIEW_NOTES){ sel_note-=area/2; if(sel_note<0) sel_note=0; }
+            if(view==VIEW_SCHED){ sel_sched-=area/2; if(sel_sched<0) sel_sched=0; }
+            else if(view==VIEW_NOTES){ sel_note-=area/2; if(sel_note<0) sel_note=0; }
             else { sel-=area/2; if(sel<0) sel=0; }
             break;
 
         case 'J': case 'K':{
             /* move the selected item down/up in the list */
             int dir=(key=='J')?1:-1;
+            if(view==VIEW_SCHED) break;   /* scheduled list is time-ordered */
             if(view==VIEW_NOTES){
                 if(note_vis_count<2) break;
                 int cur=sel_note, nxt=cur+dir;
@@ -1868,7 +2313,33 @@ int main(int argc, char *argv[]){
         }
 
         case 'n':{
-            if(view==VIEW_NOTES){
+            if(view==VIEW_SCHED){
+                char buf[MAX_LINE]="";
+                if(popup("New scheduled task","what needs doing?",buf,(int)sizeof buf)){
+                    char tbuf[MAX_LINE]="", hint[128];
+                    sched_hint(hint,(int)sizeof hint);
+                    SchedVal sv;
+                    if(popup_impl("Schedule",hint,tbuf,(int)sizeof tbuf,validate_sched_time,&sv)){
+                        time_t when=sv.when;
+                        if(todo_count<MAX_TODOS){
+                            Todo *t=&todos[todo_count];
+                            memset(t,0,sizeof *t);
+                            snprintf(t->tag,MAX_TAG,"none");
+                            snprintf(t->text,MAX_LINE,"%s",buf);
+                            t->created_at=time(NULL);
+                            t->sched_at=when;
+                            todo_count++; todos_save();
+                            rebuild_vis(); rebuild_sched_vis();
+                            sel_sched=sched_vis_count-1;
+                            char m[96],tsbuf[32];
+                            fmt_ts(when,tsbuf,(int)sizeof tsbuf);
+                            snprintf(m,sizeof m,"will appear %s~",tsbuf);
+                            set_smsg(m);
+                        }
+                    }
+                }
+            }
+            else if(view==VIEW_NOTES){
                 char buf[MAX_NOTE]="";
                 if(popup_edit_ml("New note",buf,sizeof buf)&&note_count<MAX_NOTES){
                     Note *nt=&notes[note_count];
@@ -1898,13 +2369,16 @@ int main(int argc, char *argv[]){
             if(view==VIEW_NOTES){
                 edit_selected_note();
             } else {
-                if(vis_count==0) break;
-                Todo *t=&todos[vis[sel]];
+                if((view==VIEW_SCHED?sched_vis_count:vis_count)==0) break;
+                int ti = (view==VIEW_SCHED) ? sched_vis[sel_sched] : vis[sel];
+                Todo *t=&todos[ti];
                 char buf[MAX_LINE];
                 snprintf(buf, MAX_LINE, "%s", t->text);
                 if(popup("Edit task","edit text  (Esc=cancel)",buf,(int)sizeof buf)){
                     snprintf(t->text, MAX_LINE, "%s", buf);
-                    todos_save(); rebuild_vis(); set_smsg("task updated! nya~");
+                    todos_save();
+                    if(view==VIEW_SCHED) rebuild_sched_vis(); else rebuild_vis();
+                    set_smsg("task updated! nya~");
                 }
                 /* flush any queued input from popup interaction */
                 timeout(0); while(getch()!=ERR); timeout(-1);
@@ -1918,6 +2392,11 @@ int main(int argc, char *argv[]){
                 Note *n=&notes[note_vis[sel_note]];
                 if(!n->text[0]) { set_smsg("empty note (press e to write)"); break; }
                 view_multiline("NOTE", n->text);
+            } else if(view==VIEW_SCHED){
+                if(sched_vis_count==0) break;
+                Todo *t=&todos[sched_vis[sel_sched]];
+                if(!t->desc[0]) { set_smsg("no description (press m to add)"); break; }
+                view_multiline("DESCRIPTION", t->desc);
             } else {
                 if(vis_count==0) break;
                 Todo *t=&todos[vis[sel]];
@@ -1932,6 +2411,14 @@ int main(int argc, char *argv[]){
         case 'm':{
             if(view==VIEW_NOTES){
                 edit_selected_note();
+            }
+            else if(view==VIEW_SCHED && sched_vis_count>0){
+                Todo *t=&todos[sched_vis[sel_sched]];
+                if(popup_edit_ml("Task description",t->desc,sizeof t->desc)){
+                    todos_save(); set_smsg("description saved! nya~");
+                }
+                /* flush any queued input from editor interaction */
+                timeout(0); while(getch()!=ERR); timeout(-1);
             }
             else if(view==VIEW_TASKS && vis_count>0){
                 Todo *t=&todos[vis[sel]];
@@ -1952,6 +2439,13 @@ int main(int argc, char *argv[]){
                 Note *n=&notes[note_vis[sel_note]];
                 if(n->text[0]) view_multiline("NOTE", n->text);
                 else           edit_selected_note();
+            } else if(view==VIEW_SCHED){
+                if(sched_vis_count==0) break;
+                Todo *t=&todos[sched_vis[sel_sched]];
+                if(t->desc[0]) view_multiline("DESCRIPTION", t->desc);
+                else if(popup_edit_ml("Task description",t->desc,sizeof t->desc)){
+                    todos_save(); set_smsg("description saved! nya~");
+                }
             } else {
                 if(vis_count==0) break;
                 Todo *t=&todos[vis[sel]];
@@ -1986,7 +2480,7 @@ int main(int argc, char *argv[]){
             break;
 
         case 't':{
-            if(view==VIEW_TASKS&&vis_count==0) break;
+            if(view!=VIEW_TASKS||vis_count==0) break;
             char hint[256]="enter tag (blank=clear)";
             if(utag_n>0){
                 int hpos=(int)snprintf(hint,sizeof hint,"existing: ");
@@ -2011,7 +2505,21 @@ int main(int argc, char *argv[]){
         }
 
         case 'd':{
-            if(view==VIEW_NOTES){
+            if(view==VIEW_SCHED){
+                if(sched_vis_count==0) break;
+                Todo *t=&todos[sched_vis[sel_sched]];
+                char buf[8]="",pr[80];
+                snprintf(pr,sizeof pr,"delete scheduled \"%.40s\"? y/N",t->text);
+                popup(pr,"",buf,(int)sizeof buf);
+                if(buf[0]=='y'||buf[0]=='Y'){
+                    int ti=sched_vis[sel_sched];
+                    for(int i=ti;i<todo_count-1;i++) todos[i]=todos[i+1];
+                    todo_count--;
+                    todos_save(); rebuild_vis(); rebuild_sched_vis();
+                    if(sel_sched>=sched_vis_count) sel_sched=sched_vis_count>0?sched_vis_count-1:0;
+                    set_smsg("deleted! poof~");
+                }
+            } else if(view==VIEW_NOTES){
                 if(note_vis_count==0) break;
                 char buf[8]="";
                 popup("delete this note? y/N","",buf,(int)sizeof buf);
@@ -2044,7 +2552,20 @@ int main(int argc, char *argv[]){
         }
 
         case 'D':{
-            if(view==VIEW_NOTES){
+            if(view==VIEW_SCHED){
+                if(sched_vis_count==0) break;
+                char buf[8]="",pr[80];
+                snprintf(pr,sizeof pr,"delete ALL %d scheduled tasks? y/N",sched_vis_count);
+                popup(pr,"!! THIS CANNOT BE UNDONE !!",buf,(int)sizeof buf);
+                if(buf[0]=='y'||buf[0]=='Y'){
+                    int w=0;
+                    for(int i=0;i<todo_count;i++)
+                        if(!is_hidden(&todos[i])) todos[w++]=todos[i];
+                    todo_count=w; sel_sched=0; sched_top=0;
+                    todos_save(); rebuild_vis(); rebuild_sched_vis();
+                    set_smsg("clean slate! fresh start nya~");
+                }
+            } else if(view==VIEW_NOTES){
                 if(note_count==0) break;
                 char buf[8]="",pr[80];
                 snprintf(pr,sizeof pr,"delete ALL %d notes? y/N",note_count);
@@ -2070,13 +2591,63 @@ int main(int argc, char *argv[]){
             break;
         }
 
+        case 'S':{   /* schedule / reschedule */
+            if(view==VIEW_SCHED){
+                if(sched_vis_count==0) break;
+                Todo *t=&todos[sched_vis[sel_sched]];
+                char buf[MAX_LINE], hint[128];
+                fmt_ymd(t->sched_at,buf,(int)sizeof buf);   /* prefill existing time */
+                sched_hint(hint,(int)sizeof hint);
+                SchedVal sv;
+                if(popup_impl("Reschedule",hint,buf,(int)sizeof buf,validate_sched_time,&sv)){
+                    t->sched_at=sv.when;
+                    todos_save(); rebuild_vis(); rebuild_sched_vis();
+                    char m[96],tsbuf[32];
+                    fmt_ts(sv.when,tsbuf,(int)sizeof tsbuf);
+                    snprintf(m,sizeof m,"will appear %s~",tsbuf);
+                    set_smsg(m);
+                }
+            }
+            else if(view==VIEW_TASKS){
+                if(vis_count==0) break;
+                Todo *t=&todos[vis[sel]];
+                char buf[MAX_LINE]="", hint[128];
+                sched_hint(hint,(int)sizeof hint);
+                SchedVal sv;
+                if(popup_impl("Schedule task",hint,buf,(int)sizeof buf,validate_sched_time,&sv)){
+                    t->sched_at=sv.when;
+                    todos_save();
+                    rebuild_vis(); rebuild_sched_vis();
+                    char m[96],tsbuf[32];
+                    fmt_ts(sv.when,tsbuf,(int)sizeof tsbuf);
+                    snprintf(m,sizeof m,"will appear %s~",tsbuf);
+                    set_smsg(m);
+                }
+            }
+            /* flush any queued input from popup interaction */
+            timeout(0); while(getch()!=ERR); timeout(-1);
+            break;
+        }
+
+        case 'u':{   /* release a scheduled task now */
+            if(view==VIEW_SCHED && sched_vis_count>0){
+                int ti=sched_vis[sel_sched];
+                move_to_front(ti);
+                todos[0].sched_at=0;
+                todos_save();
+                rebuild_vis(); rebuild_sched_vis();
+                set_smsg("released to tasks! nya~");
+            }
+            break;
+        }
+
         case '/':{
             char buf[MAX_LINE]="";
             if(popup("Search","type to filter~",buf,(int)sizeof buf))
                 snprintf(search,sizeof search,"%s",buf);
             else search[0]='\0';
-            sel=0; list_top=0; sel_note=0; note_top=0;
-            rebuild_vis(); rebuild_note_vis();
+            sel=0; list_top=0; sel_note=0; note_top=0; sel_sched=0; sched_top=0;
+            rebuild_vis(); rebuild_note_vis(); rebuild_sched_vis();
             /* flush any queued input from popup interaction */
             timeout(0); while(getch()!=ERR); timeout(-1);
             break;
@@ -2084,8 +2655,8 @@ int main(int argc, char *argv[]){
 
         case 27:
             search[0]='\0'; filter_tag[0]='\0';
-            sel=0; list_top=0; sel_note=0; note_top=0;
-            rebuild_vis(); rebuild_note_vis(); set_smsg("filters cleared~");
+            sel=0; list_top=0; sel_note=0; note_top=0; sel_sched=0; sched_top=0;
+            rebuild_vis(); rebuild_note_vis(); rebuild_sched_vis(); set_smsg("filters cleared~");
             break;
 
         case '0':
