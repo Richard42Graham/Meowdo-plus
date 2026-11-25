@@ -984,19 +984,33 @@ static int popup_needed_rows(const char *s, int field_w) {
 
 /* ------ draw: word-wrap utf-8 text (with \n paragraphs) ------
    draws into rows [row..max_row], columns [x..x+width).
+   every emitted line is padded to the full width so a shorter
+   redraw never leaves stale cells behind.
    *trunc is set if the source didn't fit. returns next free row. */
 static int draw_wrapped(WINDOW *w, int row, int max_row, int width, int x,
                         const char *src, bool *trunc) {
     int col = 0;
     if (trunc) *trunc = false;
+    #define DW_PAD() do { \
+        if (col < width && row <= max_row) \
+            mvwprintw(w, row, x + col, "%*s", width - col, ""); \
+    } while (0)
     while (*src) {
-        if (*src == '\n') { row++; col = 0; src++; continue; }
+        if (*src == '\n') {
+            DW_PAD();
+            row++; col = 0; src++;
+            continue;
+        }
         if (row > max_row) { if (trunc) *trunc = true; break; }
         wchar_t wc;
         int mb = mbtowc(&wc, src, MB_CUR_MAX);
         if (mb <= 0) { src++; continue; }
         int wcw = wcwidth(wc); if (wcw < 0) wcw = 0;
-        if (col + wcw > width) { row++; col = 0; continue; }
+        if (col + wcw > width) {
+            DW_PAD();
+            row++; col = 0;
+            continue;
+        }
         char mb_buf[MB_CUR_MAX + 1];
         memcpy(mb_buf, src, (size_t)mb);
         mb_buf[mb] = '\0';
@@ -1004,7 +1018,9 @@ static int draw_wrapped(WINDOW *w, int row, int max_row, int width, int x,
         col += wcw;
         src += mb;
     }
+    DW_PAD();
     return row;
+    #undef DW_PAD
 }
 
 /* ------ multiline editor (ported from pipboy's editor.cpp) ------ */
@@ -1779,14 +1795,24 @@ static void draw_left(WINDOW *w,int h,int lw,int top){
                 wattron(w,COLOR_PAIR(C_SEL)|A_BOLD);
                 mvwprintw(w,row,1,"%*s",lw-2,"");
             }
+            /* only the first line of a multiline note — a raw '\n' would
+               spill over the pane border */
+            const char *nl=strchr(n->text,'\n');
+            size_t tlen = nl ? (size_t)(nl - n->text) : strlen(n->text);
+            char title[512];
+            if (tlen >= sizeof title) tlen = sizeof title - 1;
+            memcpy(title, n->text, tlen);
+            title[tlen] = '\0';
+            bool more = (nl != NULL);
+            int avail=lw-8; if(avail<1)avail=1;
             wattron(w,is_sel?COLOR_PAIR(C_SEL)|A_BOLD:COLOR_PAIR(C_PEND)|A_BOLD);
             mvwprintw(w,row,2,"  ");
-            int avail=lw-8; if(avail<1)avail=1;
-            char clipped[MAX_LINE];
-            int w_used=trunc_to_width(n->text,clipped,sizeof clipped,avail);
+            char clipped[512];
+            int w_used=trunc_to_width(title,clipped,(int)sizeof clipped,
+                                      avail - (more?2:0));
             waddstr(w,clipped);
-            for(int p2=0;p2<avail-w_used;p2++) waddch(w,' ');
-            /* first line has a desc? show a hint marker */
+            if (more) waddstr(w," …");
+            for(int p2=w_used+(more?2:0);p2<avail;p2++) waddch(w,' ');
             wattrset(w,A_NORMAL);
             continue;
         }
@@ -1840,6 +1866,12 @@ static void draw_left(WINDOW *w,int h,int lw,int top){
         wattrset(w,A_NORMAL);
     }
     wnoutrefresh(w);
+}
+
+/* draw a detail line padded to the pane width, so a shorter redraw
+   never leaves stale cells behind */
+static void pane_line(WINDOW *w, int row, int pane_w, const char *text) {
+    mvwprintw(w, row, 3, "%-*s", pane_w - 5, text);
 }
 
 /* ------ draw: right pane ------ */
@@ -1931,17 +1963,23 @@ static void draw_right(WINDOW *w,int h,int rw){
                 }
             }
 
-            char tsbuf[32], cdbuf[16];
+            char tsbuf[32], cdbuf[32], linebuf[128];
             fmt_ts(t->sched_at,tsbuf,(int)sizeof tsbuf);
             fmt_in(t->sched_at,cdbuf,(int)sizeof cdbuf);
             if(ty<h-2){
+                snprintf(linebuf,sizeof linebuf,"-> %s  (in %s)",tsbuf,cdbuf);
                 wattron(w,COLOR_PAIR(C_PIN)|A_BOLD);
-                mvwprintw(w,ty++,3,"-> %s  (in %s)",tsbuf,cdbuf);
+                pane_line(w,ty,ww,linebuf); ty++;
                 wattroff(w,COLOR_PAIR(C_PIN)|A_BOLD);
             }
             fmt_ts(t->created_at,tsbuf,(int)sizeof tsbuf);
-            if(ty<h-2){wattron(w,A_DIM); mvwprintw(w,ty++,3,"+ %s",tsbuf); wattroff(w,A_DIM);}
-            if(ty<h-2){wattron(w,A_DIM); mvwprintw(w,ty++,3,"u: release now"); wattroff(w,A_DIM);}
+            if(ty<h-2){
+                snprintf(linebuf,sizeof linebuf,"+ %s",tsbuf);
+                wattron(w,A_DIM); pane_line(w,ty,ww,linebuf); ty++; wattroff(w,A_DIM);
+            }
+            if(ty<h-2){
+                wattron(w,A_DIM); pane_line(w,ty,ww,"u: release now"); ty++; wattroff(w,A_DIM);
+            }
         }
     }
     else if(view==VIEW_NOTES){
@@ -1956,11 +1994,14 @@ static void draw_right(WINDOW *w,int h,int rw){
             ty=draw_wrapped(w,ty,h-4,ca-2,3,n->text,&trunc)+1;
             wattroff(w,COLOR_PAIR(C_PEND)|A_BOLD);
             if(trunc&&ty<h-2){
-                wattron(w,A_DIM); mvwprintw(w,ty++,3,"… v: view full"); wattroff(w,A_DIM);
+                wattron(w,A_DIM); pane_line(w,ty,ww,"… v: view full"); ty++; wattroff(w,A_DIM);
             }
-            char tsbuf[32];
+            char tsbuf[32], linebuf[64];
             fmt_ts(n->created_at,tsbuf,(int)sizeof tsbuf);
-            if(ty<h-2){wattron(w,A_DIM); mvwprintw(w,ty++,3,"+ %s",tsbuf); wattroff(w,A_DIM);}
+            if(ty<h-2){
+                snprintf(linebuf,sizeof linebuf,"+ %s",tsbuf);
+                wattron(w,A_DIM); pane_line(w,ty,ww,linebuf); ty++; wattroff(w,A_DIM);
+            }
         }
     }
     else if(vis_count>0&&sel<vis_count&&ty<h-3){
@@ -1990,15 +2031,19 @@ static void draw_right(WINDOW *w,int h,int rw){
         }
 
         if(t->pinned&&ty<h-3){
-            wattron(w,COLOR_PAIR(C_PIN)|A_DIM); mvwprintw(w,ty++,3,"* pinned"); wattroff(w,COLOR_PAIR(C_PIN)|A_DIM);
+            wattron(w,COLOR_PAIR(C_PIN)|A_DIM); pane_line(w,ty,ww,"* pinned"); ty++; wattroff(w,COLOR_PAIR(C_PIN)|A_DIM);
         }
-        char tsbuf[32];
+        char tsbuf[32], linebuf[64];
         fmt_ts(t->created_at,tsbuf,(int)sizeof tsbuf);
-        if(ty<h-2){wattron(w,A_DIM); mvwprintw(w,ty++,3,"+ %s",tsbuf); wattroff(w,A_DIM);}
+        if(ty<h-2){
+            snprintf(linebuf,sizeof linebuf,"+ %s",tsbuf);
+            wattron(w,A_DIM); pane_line(w,ty,ww,linebuf); ty++; wattroff(w,A_DIM);
+        }
         if(t->done_at&&ty<h-2){
             fmt_ts(t->done_at,tsbuf,(int)sizeof tsbuf);
+            snprintf(linebuf,sizeof linebuf,"v %s",tsbuf);
             wattron(w,COLOR_PAIR(C_GREEN)|A_DIM);
-            mvwprintw(w,ty++,3,"v %s",tsbuf);
+            pane_line(w,ty,ww,linebuf); ty++;
             wattroff(w,COLOR_PAIR(C_GREEN)|A_DIM);
         }
     }
