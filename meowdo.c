@@ -131,7 +131,8 @@ typedef struct {
     time_t created_at;
 } Note;
 
-typedef enum { VIEW_TASKS, VIEW_NOTES, VIEW_SCHED } View;
+/* tab order: Tab cycles TASKS -> SCHEDULED -> NOTES -> TASKS */
+typedef enum { VIEW_TASKS, VIEW_SCHED, VIEW_NOTES } View;
 
 static Todo todos[MAX_TODOS];
 static int  todo_count = 0;
@@ -163,7 +164,7 @@ static int  utag_n     = 0;
 static int  tags_dirty = 1;
 
 /* frame-cached counts --- computed once per frame, not per draw call */
-static int  g_pend=0, g_done_c=0, g_pin_c=0, g_sched_c=0;
+static int  g_pend=0, g_done_c=0, g_pin_c=0, g_sched_c=0, g_total_vis=0;
 
 /* ------ helpers ------ */
 static int tag_color(const char *tag) {
@@ -290,6 +291,7 @@ static void recount(void) {
         if(todos[i].done) g_done_c++; else g_pend++;
         if(todos[i].pinned) g_pin_c++;
     }
+    g_total_vis = g_pend + g_done_c;   /* tasks visible in the TASKS tab */
 }
 
 /* ------ JSON helpers (minimal, enough for our schema) ------ */
@@ -982,10 +984,25 @@ static int popup_needed_rows(const char *s, int field_w) {
     return rows;
 }
 
+/* display width of the word starting at p (runs until space/tab/newline) */
+static int measure_word(const char *p) {
+    int wid = 0;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n') {
+        wchar_t wc;
+        int mb = mbtowc(&wc, p, MB_CUR_MAX);
+        if (mb <= 0) { p++; continue; }
+        int cw = wcwidth(wc);
+        if (cw < 0) cw = 0;
+        wid += cw;
+        p += mb;
+    }
+    return wid;
+}
+
 /* ------ draw: word-wrap utf-8 text (with \n paragraphs) ------
-   draws into rows [row..max_row], columns [x..x+width).
-   every emitted line is padded to the full width so a shorter
-   redraw never leaves stale cells behind.
+   breaks at word boundaries when possible; words longer than a whole
+   line are hard-broken. every emitted line is padded to the full width
+   so a shorter redraw never leaves stale cells behind.
    *trunc is set if the source didn't fit. returns next free row. */
 static int draw_wrapped(WINDOW *w, int row, int max_row, int width, int x,
                         const char *src, bool *trunc) {
@@ -995,28 +1012,44 @@ static int draw_wrapped(WINDOW *w, int row, int max_row, int width, int x,
         if (col < width && row <= max_row) \
             mvwprintw(w, row, x + col, "%*s", width - col, ""); \
     } while (0)
-    while (*src) {
-        if (*src == '\n') {
+    const char *p = src;
+    while (*p) {
+        if (row > max_row) { if (trunc) *trunc = true; break; }
+        if (*p == '\n') {
             DW_PAD();
-            row++; col = 0; src++;
+            row++; col = 0; p++;
             continue;
         }
-        if (row > max_row) { if (trunc) *trunc = true; break; }
+        if (*p == ' ' || *p == '\t') {
+            /* collapse space runs; break here if the next word won't fit */
+            const char *q = p;
+            while (*q == ' ' || *q == '\t') q++;
+            int wwid = measure_word(q);
+            if (col > 0 && col + 1 + wwid > width) {
+                DW_PAD();
+                row++; col = 0;
+                p = q;                     /* line break consumes the spaces */
+                continue;
+            }
+            if (col > 0) { mvwprintw(w, row, x + col, " "); col++; }
+            p++;
+            continue;
+        }
         wchar_t wc;
-        int mb = mbtowc(&wc, src, MB_CUR_MAX);
-        if (mb <= 0) { src++; continue; }
+        int mb = mbtowc(&wc, p, MB_CUR_MAX);
+        if (mb <= 0) { p++; continue; }
         int wcw = wcwidth(wc); if (wcw < 0) wcw = 0;
-        if (col + wcw > width) {
+        if (col + wcw > width) {           /* hard break inside a long word */
             DW_PAD();
             row++; col = 0;
             continue;
         }
         char mb_buf[MB_CUR_MAX + 1];
-        memcpy(mb_buf, src, (size_t)mb);
+        memcpy(mb_buf, p, (size_t)mb);
         mb_buf[mb] = '\0';
         mvwprintw(w, row, x + col, "%s", mb_buf);
         col += wcw;
-        src += mb;
+        p += mb;
     }
     DW_PAD();
     return row;
@@ -1253,7 +1286,7 @@ static int popup_edit_ml(const char *title, char *out, size_t outlen) {
 
     if (ed.accepted) ml_serialize(&ed, out, outlen);
     delwin(p);
-    touchwin(stdscr); refresh();
+    clearok(stdscr, TRUE); touchwin(stdscr); refresh();
     return ed.accepted && !cancelled;
 }
 
@@ -1336,7 +1369,7 @@ static void view_multiline(const char *title, const char *text) {
         }
     }
     delwin(w);
-    touchwin(stdscr); refresh();
+    clearok(stdscr, TRUE); touchwin(stdscr); refresh();
 }
 
 
@@ -1521,7 +1554,8 @@ static int popup_impl(const char *title, const char *hint, char *out, int maxlen
     #undef POPUP_REDRAW
     #undef PH_FOR
     #undef CLAMP_PH
-    curs_set(0); delwin(p); touchwin(stdscr); refresh();
+    curs_set(0); delwin(p);
+    clearok(stdscr, TRUE); touchwin(stdscr); refresh();
     return (!cancelled && len > 0);
 }
 
@@ -1572,7 +1606,7 @@ static void draw_top(WINDOW *w,int cols){
     char title[64];
     const char *tabname = (view==VIEW_TASKS)?"TASKS":(view==VIEW_NOTES)?"NOTES":"SCHED";
     snprintf(title,sizeof title," =^..^=  meowdo // %s(%d) ",tabname,
-        view==VIEW_TASKS?todo_count:(view==VIEW_NOTES?note_count:g_sched_c));
+        view==VIEW_TASKS?g_total_vis:(view==VIEW_NOTES?note_count:g_sched_c));
     mvwprintw(w,0,2,"%s",title);
     int cx=2+(int)strlen(title)+1;
     if(filter_tag[0]){
@@ -1617,11 +1651,11 @@ static void draw_sbar(WINDOW *w,int cols){
             mvwprintw(w,0,1," n  e  v  d  D  /  Tab  q");
     }
     else if(cols>124)
-        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  J/K:move  p:pin  t:tag  S:sched  d:del  D:del-all  /:search  Tab:notes  q:quit");
+        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  J/K:move  p:pin  t:tag  S:sched  d:del  D:del-all  /:search  Tab:sched  q:quit");
     else if(cols>100)
-        mvwprintw(w,0,1," n:new  e:edit  m:desc  Spc:done  J/K:move  S:sched  d:del  /:search  Tab:notes  q:quit");
+        mvwprintw(w,0,1," n:new  e:edit  m:desc  Spc:done  J/K:move  S:sched  d:del  /:search  Tab:sched  q:quit");
     else if(cols>50)
-        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  d:del  D:all  /:search  Tab:notes  q:quit");
+        mvwprintw(w,0,1," n:new  e:edit  m:desc  v:view  Spc:done  d:del  D:all  /:search  Tab:sched  q:quit");
     else
         mvwprintw(w,0,1," n  e  m  v  Spc  d  D  /  Tab  q");
     if(smsg[0]&&smsg_ttl>0){
@@ -1638,16 +1672,16 @@ static void draw_sbar(WINDOW *w,int cols){
 
 /* ------ draw: progress bar ------ */
 static void draw_progress(WINDOW *w,int y,int x,int width){
-    if(!w||todo_count==0||width<4) return;
-    int filled=(width*g_done_c)/todo_count;
-    int pct=(g_done_c*100)/todo_count;
+    if(!w||g_total_vis==0||width<4) return;
+    int filled=(width*g_done_c)/g_total_vis;
+    int pct=(g_done_c*100)/g_total_vis;
     wattron(w,COLOR_PAIR(C_GREEN)|A_BOLD); mvwprintw(w,y,x,"[");
     for(int i=0;i<width;i++){
         if(i<filled){wattron(w,COLOR_PAIR(C_GREEN)|A_BOLD);waddch(w,'#');}
         else        {wattron(w,COLOR_PAIR(C_DONE)|A_DIM); waddch(w,'-');}
     }
     wattron(w,COLOR_PAIR(C_GREEN)|A_BOLD);
-    wprintw(w,"] %d%%  %d/%d",pct,g_done_c,todo_count);
+    wprintw(w,"] %d%%  %d/%d",pct,g_done_c,g_total_vis);
     wattroff(w,A_BOLD|A_DIM);
 }
 
@@ -1898,20 +1932,20 @@ static void draw_right(WINDOW *w,int h,int rw){
     wattron(w,COLOR_PAIR(C_PEND)|A_BOLD);  mvwprintw(w,2,2," * pending : %d",g_pend);    wattroff(w,COLOR_PAIR(C_PEND)|A_BOLD);
     wattron(w,COLOR_PAIR(C_GREEN)|A_BOLD); mvwprintw(w,3,2," x done    : %d",g_done_c);  wattroff(w,COLOR_PAIR(C_GREEN)|A_BOLD);
     wattron(w,COLOR_PAIR(C_PIN)|A_BOLD);   mvwprintw(w,4,2," ^ pinned  : %d",g_pin_c);   wattroff(w,COLOR_PAIR(C_PIN)|A_BOLD);
-    wattron(w,A_DIM);                      mvwprintw(w,5,2," # total   : %d",todo_count); wattroff(w,A_DIM);
+    wattron(w,A_DIM);                      mvwprintw(w,5,2," # total   : %d",g_total_vis); wattroff(w,A_DIM);
 
     /* mini progress */
-    if(todo_count>0){
+    if(g_total_vis>0){
         int bw=ca-8; if(bw>20)bw=20; if(bw<4)bw=4;
         wattron(w,COLOR_PAIR(C_BORDER)|A_DIM); mvwhline(w,6,2,ACS_HLINE,ca); wattroff(w,COLOR_PAIR(C_BORDER)|A_DIM);
-        int filled=(bw*g_done_c)/todo_count;
+        int filled=(bw*g_done_c)/g_total_vis;
         wattron(w,COLOR_PAIR(C_GREEN)|A_BOLD); mvwprintw(w,7,2,"[");
         for(int i=0;i<bw;i++){
             if(i<filled){wattron(w,COLOR_PAIR(C_GREEN)|A_BOLD);waddch(w,'#');}
             else        {wattron(w,COLOR_PAIR(C_DONE)|A_DIM); waddch(w,'.');}
         }
         wattron(w,COLOR_PAIR(C_GREEN)|A_BOLD);
-        wprintw(w,"] %d%%",(g_done_c*100)/todo_count);
+        wprintw(w,"] %d%%",(g_done_c*100)/g_total_vis);
         wattroff(w,A_BOLD|A_DIM);
     }
 
@@ -2119,7 +2153,7 @@ static void print_help(void) {
     printf("  --version    Show version information\n");
     printf("  --help       Show this help message\n\n");
     printf("Keys:\n");
-    printf("  Tab          Cycle TASKS / NOTES / SCHEDULED (Shift-Tab back)\n");
+    printf("  Tab          Cycle TASKS / SCHEDULED / NOTES (Shift-Tab back)\n");
     printf("  j/k          Navigate up/down\n");
     printf("  J/K          Move selected task/note down/up\n");
     printf("  g/G          Jump to top/bottom\n");

@@ -118,7 +118,7 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
 
 | Key | Action |
 |-----|--------|
-| `Tab` | cycle TASKS → NOTES → SCHEDULED (Shift-Tab back) |
+| `Tab` | cycle TASKS → SCHEDULED → NOTES (Shift-Tab back) |
 | `j` / `↓` | move down |
 | `k` / `↑` | move up |
 | `J` / `K` | move selected task/note down / up |
