@@ -142,6 +142,18 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
 | `0` | show all tasks |
 | `q` | quit |
 
+## Mouse
+
+meowdo supports mouse input in xterm-compatible terminals (and inside tmux
+with `set -g mouse on`):
+
+| Action | Result |
+|--------|--------|
+| click a task / note row | select it |
+| double-click a task / note | open its memo (edit if empty, view otherwise) |
+| scroll wheel | move the selection up / down |
+| click a tab label in the top bar | switch tab |
+
 ## Scheduling tasks
 
 Press `S` on a task (or `n` in the SCHEDULED tab) and enter a time. Accepted

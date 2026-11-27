@@ -713,6 +713,16 @@ static void move_to_front(int i) {
     todos[0]=t;
 }
 
+/* switch the active tab (Tab key and mouse clicks).
+   NOTE: callers must reset list_top/note_top/sched_top. */
+static void switch_view(View v) {
+    view = v;
+    if (view==VIEW_TASKS)      rebuild_vis();
+    else if (view==VIEW_SCHED) rebuild_sched_vis();
+    else                       rebuild_note_vis();
+    set_smsg(view==VIEW_TASKS?"tasks tab":(view==VIEW_SCHED?"scheduled tab":"notes tab"));
+}
+
 /* reveal every task whose schedule time has arrived: move to the top
    of the list (below pinned, which the class sort keeps above) and
    clear sched_at. returns true if anything was revealed. */
@@ -1496,6 +1506,10 @@ static int popup_impl(const char *title, const char *hint, char *out, int maxlen
         else if (ch == KEY_HOME || ch == KEY_BEG) cur_byte = 0;
         else if (ch == KEY_END)       cur_byte = len;
         /* ignore ONLY actual key codes (not ASCII chars) to prevent leaking to main loop */
+        if (ch == KEY_MOUSE) {
+            MEVENT me;
+            while (getmouse(&me) == OK) {}   /* drain so input never stalls */
+        }
         else if (ch == KEY_UP || ch == KEY_DOWN || ch == KEY_PPAGE || ch == KEY_NPAGE) {
             /* just redraw and keep waiting for valid input */
             POPUP_REDRAW();
@@ -1598,17 +1612,40 @@ static void draw_toosmall(int rows, int cols) {
 }
 
 /* ------ draw: top bar ------ */
+/* clickable tab label rectangles (screen columns), set each frame by
+   draw_top and used by the mouse handler */
+static int g_tab_x0[3] = {-1,-1,-1};
+static int g_tab_x1[3] = {-1,-1,-1};
+
 static void draw_top(WINDOW *w,int cols){
     if(!w) return;
     werase(w);
     wattron(w,COLOR_PAIR(C_TOPBAR)|A_BOLD);
     mvwprintw(w,0,0,"%*s",cols,"");
-    char title[64];
-    const char *tabname = (view==VIEW_TASKS)?"TASKS":(view==VIEW_NOTES)?"NOTES":"SCHED";
-    snprintf(title,sizeof title," =^..^=  meowdo // %s(%d) ",tabname,
-        view==VIEW_TASKS?g_total_vis:(view==VIEW_NOTES?note_count:g_sched_c));
-    mvwprintw(w,0,2,"%s",title);
-    int cx=2+(int)strlen(title)+1;
+    mvwprintw(w,0,2," =^..^=  meowdo ");
+    wattroff(w,COLOR_PAIR(C_TOPBAR)|A_BOLD);
+
+    /* the three tab labels — order matches the Tab-key cycle */
+    static const char *names[3] = {"TASKS","SCHED","NOTES"};
+    const int counts[3] = { g_total_vis, g_sched_c, note_count };
+    int cx = 2 + 16 + 1;
+    for (int i=0;i<3;i++) {
+        char lab[24];
+        snprintf(lab,sizeof lab," %s(%d) ",names[i],counts[i]);
+        int ll=(int)strlen(lab);
+        g_tab_x0[i]=cx; g_tab_x1[i]=cx+ll-1;
+        if ((View)i==view) {
+            wattron(w,COLOR_PAIR(C_SEL)|A_BOLD);
+            mvwprintw(w,0,cx,"%s",lab);
+            wattroff(w,COLOR_PAIR(C_SEL)|A_BOLD);
+        } else {
+            wattron(w,COLOR_PAIR(C_TOPBAR)|A_BOLD);
+            mvwprintw(w,0,cx,"%s",lab);
+            wattroff(w,COLOR_PAIR(C_TOPBAR)|A_BOLD);
+        }
+        cx += ll + 1;
+    }
+
     if(filter_tag[0]){
         wattron(w,COLOR_PAIR(C_TAG1)|A_BOLD);
         mvwprintw(w,0,cx," #%s ",filter_tag); cx+=(int)strlen(filter_tag)+4;
@@ -1622,7 +1659,8 @@ static void draw_top(WINDOW *w,int cols){
     time_t now=time(NULL); struct tm tb; struct tm *tm=localtime_r(&now,&tb);
     if(tm){
         char ts[32]; strftime(ts,sizeof ts,"%H:%M  %a %d %b",tm);
-        mvwprintw(w,0,cols-(int)strlen(ts)-2,"%s",ts);
+        if (cx < cols - (int)strlen(ts) - 3)   /* only if it fits beside the tabs */
+            mvwprintw(w,0,cols-(int)strlen(ts)-2,"%s",ts);
     }
     wattroff(w,COLOR_PAIR(C_TOPBAR)|A_BOLD);
     wnoutrefresh(w);
@@ -2139,6 +2177,33 @@ static void edit_selected_note(void) {
     timeout(0); while(getch()!=ERR); timeout(-1);
 }
 
+/* open the memo for the selected item (Enter key and double-click):
+   view full-screen if it has content, otherwise open the editor */
+static void open_selected_memo(void) {
+    if(view==VIEW_NOTES){
+        if(note_vis_count==0) return;
+        Note *n=&notes[note_vis[sel_note]];
+        if(n->text[0]) view_multiline("NOTE", n->text);
+        else           edit_selected_note();
+    } else if(view==VIEW_SCHED){
+        if(sched_vis_count==0) return;
+        Todo *t=&todos[sched_vis[sel_sched]];
+        if(t->desc[0]) view_multiline("DESCRIPTION", t->desc);
+        else if(popup_edit_ml("Task description",t->desc,sizeof t->desc)){
+            todos_save(); set_smsg("description saved! nya~");
+        }
+    } else {
+        if(vis_count==0) return;
+        Todo *t=&todos[vis[sel]];
+        if(t->desc[0]) view_multiline("DESCRIPTION", t->desc);
+        else if(popup_edit_ml("Task description",t->desc,sizeof t->desc)){
+            todos_save(); set_smsg("description saved! nya~");
+        }
+    }
+    /* flush any queued input from editor/viewer interaction */
+    timeout(0); while(getch()!=ERR); timeout(-1);
+}
+
 static void print_version(void) {
     printf("meowdo version 1.5.0\n");
     printf("thanks for using meowdo :3\n");
@@ -2171,9 +2236,14 @@ static void print_help(void) {
     printf("  D            Delete ALL tasks / notes / scheduled\n");
     printf("  /            Search\n");
     printf("  Esc          Clear search + filter\n");
-    printf("  1-6          Filter by tag\n");
+      printf("  1-6          Filter by tag\n");
     printf("  0            Show all\n");
     printf("  q            Quit\n");
+    printf("\nMouse:\n");
+    printf("  Click a row  Select task / note\n");
+    printf("  Double-click Open memo (edit if empty, view otherwise)\n");
+    printf("  Wheel        Move selection up/down\n");
+    printf("  Click tab    Switch tab (top bar labels)\n");
 }
 
 static bool parse_args(int argc, char *argv[]) {
@@ -2209,9 +2279,11 @@ int main(int argc, char *argv[]){
     g_utf8 = detect_utf8();
     BONGO   = g_utf8 ? BONGO_UTF8 : BONGO_ASCII;
     build_paths();
-    initscr(); 
+    initscr();
     cbreak(); noecho(); curs_set(0);
     keypad(stdscr,TRUE);
+    mousemask(BUTTON1_CLICKED | BUTTON1_DOUBLE_CLICKED
+              | BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
     if(!has_colors()){endwin();puts("need color terminal");return 1;}
     start_color(); use_default_colors();
 
@@ -2321,12 +2393,8 @@ int main(int argc, char *argv[]){
         case 'q': running=false; break;
 
         case '\t': case KEY_BTAB:
-            view = (View)(((int)view + ((key=='\t')?1:2)) % 3);
+            switch_view((View)(((int)view + ((key=='\t')?1:2)) % 3));
             list_top=0; note_top=0; sched_top=0;
-            if(view==VIEW_TASKS)      rebuild_vis();
-            else if(view==VIEW_NOTES) rebuild_note_vis();
-            else                      rebuild_sched_vis();
-            set_smsg(view==VIEW_TASKS?"tasks tab":(view==VIEW_NOTES?"notes tab":"scheduled tab"));
             break;
 
         case KEY_UP: case 'k':
@@ -2510,31 +2578,54 @@ int main(int argc, char *argv[]){
             break;
         }
 
-        case '\n': case '\r': case KEY_ENTER:{
+        case '\n': case '\r': case KEY_ENTER:
             /* Enter opens the memo for the selected item:
                edit if empty, view full-screen otherwise */
-            if(view==VIEW_NOTES){
-                if(note_vis_count==0) break;
-                Note *n=&notes[note_vis[sel_note]];
-                if(n->text[0]) view_multiline("NOTE", n->text);
-                else           edit_selected_note();
-            } else if(view==VIEW_SCHED){
-                if(sched_vis_count==0) break;
-                Todo *t=&todos[sched_vis[sel_sched]];
-                if(t->desc[0]) view_multiline("DESCRIPTION", t->desc);
-                else if(popup_edit_ml("Task description",t->desc,sizeof t->desc)){
-                    todos_save(); set_smsg("description saved! nya~");
+            open_selected_memo();
+            break;
+
+        case KEY_MOUSE: {
+            MEVENT ev;
+            if (getmouse(&ev) != OK) break;
+            if (ev.bstate & (BUTTON1_CLICKED | BUTTON1_DOUBLE_CLICKED)) {
+                if (ev.y == 0) {
+                    /* tab label click */
+                    for (int i = 0; i < 3; i++) {
+                        if (ev.x >= g_tab_x0[i] && ev.x <= g_tab_x1[i]) {
+                            if ((View)i != view) {
+                                switch_view((View)i);
+                                list_top=0; note_top=0; sched_top=0;
+                            }
+                            break;
+                        }
+                    }
                 }
-            } else {
-                if(vis_count==0) break;
-                Todo *t=&todos[vis[sel]];
-                if(t->desc[0]) view_multiline("DESCRIPTION", t->desc);
-                else if(popup_edit_ml("Task description",t->desc,sizeof t->desc)){
-                    todos_save(); set_smsg("description saved! nya~");
+                else if (ev.y >= 1 && ev.y <= ch) {
+                    /* list row click */
+                    int i = ev.y - 1 - LIST_Y0;   /* visible row index */
+                    if (i >= 0 && i < area && ev.x < pane_w) {
+                        int vi = *top_p + i;
+                        if (vi < ((view==VIEW_TASKS)?vis_count:
+                                  (view==VIEW_NOTES)?note_vis_count:sched_vis_count)) {
+                            if      (view==VIEW_TASKS) sel       = vi;
+                            else if(view==VIEW_NOTES)  sel_note  = vi;
+                            else                       sel_sched = vi;
+                            if (ev.bstate & BUTTON1_DOUBLE_CLICKED)
+                                open_selected_memo();
+                        }
+                    }
                 }
             }
-            /* flush any queued input from editor/viewer interaction */
-            timeout(0); while(getch()!=ERR); timeout(-1);
+            else if (ev.bstate & BUTTON4_PRESSED) {       /* wheel up */
+                if      (view==VIEW_SCHED){ if(sel_sched>0) sel_sched--; }
+                else if(view==VIEW_NOTES){ if(sel_note>0) sel_note--; }
+                else                    { if(sel>0) sel--; }
+            }
+            else if (ev.bstate & BUTTON5_PRESSED) {       /* wheel down */
+                if      (view==VIEW_SCHED){ if(sel_sched<sched_vis_count-1) sel_sched++; }
+                else if(view==VIEW_NOTES){ if(sel_note<note_vis_count-1) sel_note++; }
+                else                    { if(sel<vis_count-1) sel++; }
+            }
             break;
         }
 
