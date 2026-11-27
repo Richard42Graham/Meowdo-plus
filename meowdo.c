@@ -78,6 +78,221 @@ enum {
     C_TAG5=20,  C_TAG6=21,  C_TAG7=22,  C_TAG8=23,
 };
 
+/* ── themes ──
+   Every theme ships two palettes: "ext" (256-color, used when the
+   terminal has COLORS>=256) and "ansi" (8-color fallback). */
+typedef struct {
+    short border;
+    short topbar_fg, topbar_bg;
+    short sel_fg, sel_bg;
+    short done, pend, bongo;
+    short sbar_fg, sbar_bg;
+    short hdr, green, pin;
+    short search_fg, search_bg;
+    short beat_fg, beat_bg;
+    short title_fg, title_bg;
+    short tag[6];
+    short tag7, tag8_fg, tag8_bg;
+} ThemeSpec;
+
+typedef struct {
+    const char *name;
+    ThemeSpec ext;
+    ThemeSpec ansi;
+} Theme;
+
+#define N_THEMES 8
+
+/* short aliases for the ncurses COLOR_* constants (table readability) */
+#define BLACK   COLOR_BLACK
+#define RED     COLOR_RED
+#define GREEN   COLOR_GREEN
+#define YELLOW  COLOR_YELLOW
+#define BLUE    COLOR_BLUE
+#define MAGENTA COLOR_MAGENTA
+#define CYAN    COLOR_CYAN
+#define WHITE   COLOR_WHITE
+
+static const Theme THEMES[N_THEMES] = {
+
+{ "meowdo",
+  /* ext: classic ANSI — follows the terminal palette (any background)
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  CYAN, BLACK, MAGENTA, BLACK, CYAN,  WHITE,  YELLOW, MAGENTA, BLACK, BLUE,
+  /* hdr    grn     pin     sefg  sebg    bef   beb     tifg  tibg */
+     CYAN,  GREEN,  RED,    BLACK, YELLOW, BLACK, YELLOW, BLACK, CYAN,
+  /* tags 1..6 */
+     { GREEN, YELLOW, CYAN, MAGENTA, RED, BLUE },  WHITE,  GREEN, BLUE },
+  /* ansi: same as ext */
+  {  CYAN, BLACK, MAGENTA, BLACK, CYAN,  WHITE,  YELLOW, MAGENTA, BLACK, BLUE,
+     CYAN,  GREEN,  RED,    BLACK, YELLOW, BLACK, YELLOW, BLACK, CYAN,
+     { GREEN, YELLOW, CYAN, MAGENTA, RED, BLUE },  WHITE,  GREEN, BLUE }
+},
+
+{ "midnight",
+  /* ext: high-contrast brights for dark backgrounds
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  12,   15,    4,       0,    14,    8,      11,     13,     15,   4,
+  /* hdr    grn     pin     sefg  sebg    bef   beb     tifg  tibg */
+     12,    10,     9,      0,    11,     0,    11,     0,    14,
+     { 10, 11, 14, 13, 9, 12 },  15,  10, 4 },
+  /* ansi: 8-color fallback — blue selection bar
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  4,   7,     4,       0,    4,     7,      3,      5,      7,    4,
+     4,     2,     1,      0,    3,     0,      3,      0,    6,
+     { 2, 3, 6, 5, 1, 4 },  7,  2, 4 }
+},
+
+{ "dracula",
+  /* ext: #282a36 background, pink accents
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  61,   235,   141,     235,  117,   61,     228,    141,    235,  61,
+  /* hdr    grn     pin     sefg  sebg    bef   beb     tifg  tibg */
+     117,   84,     212,    235,  228,   235,    228,    235,  117,
+     { 84, 228, 117, 141, 212, 215 },  254,  84, 61 },
+  /* ansi: 8-color fallback — pink/magenta accents
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  6,   0,     5,       0,    6,     7,      5,      5,      0,    4,
+     6,     2,     1,      0,    3,     0,      3,      0,    6,
+     { 2, 5, 6, 3, 1, 4 },  7,  2, 4 }
+},
+
+{ "gruvbox",
+  /* ext: #282828 background, warm palette, orange pin
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  109,  235,   208,     235,  142,   245,    214,    175,    223,  237,
+  /* hdr    grn     pin     sefg  sebg    bef   beb     tifg  tibg */
+     214,   142,    208,    235,  214,   235,    214,    235,  142,
+     { 142, 214, 108, 109, 208, 175 },  223,  142, 237 },
+  /* ansi: 8-color fallback */
+  {  4,   0,     3,       0,    2,     7,      3,      5,      0,    4,
+     3,     2,     1,      0,    3,     0,      3,      0,    2,
+     { 2, 3, 6, 5, 1, 5 },  7,  2, 4 }
+},
+
+{ "nord",
+  /* ext: #2e3440 background, frost palette, soft-red pin
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  109,  236,   109,     236,  110,   240,    187,    139,    254,  237,
+  /* hdr    grn     pin     sefg  sebg    bef   beb     tifg  tibg */
+     110,   150,    168,    236,  187,   236,    187,    236,  110,
+     { 150, 187, 108, 139, 168, 173 },  254,  150, 237 },
+  /* ansi: 8-color fallback — cyan pending, blue pin
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  4,   0,     4,       0,    6,     7,      6,      5,      0,    4,
+     4,     2,     4,      0,    3,     0,      3,      0,    6,
+     { 2, 6, 3, 5, 1, 4 },  7,  2, 4 }
+},
+
+{ "solarized-light",
+  /* ext: #fdf6e3 background, orange pin
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  241,  230,   136,     230,  36,    245,    136,    162,    230,  241,
+  /* hdr    grn     pin     sefg  sebg    bef   beb     tifg  tibg */
+     32,    106,    166,    230,  166,   230,    166,    230,  36,
+     { 106, 136, 36, 162, 166, 32 },  241,  106, 241 },
+  /* ansi: 8-color fallback — black done text for light backgrounds
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  4,   0,     3,       0,    6,     0,      3,      5,      0,    4,
+     4,     2,     1,      0,    3,     0,      3,      0,    6,
+     { 2, 3, 6, 5, 1, 4 },  0,  2, 4 }
+},
+
+{ "white",
+  /* ext: monochrome white — black & white terminal look
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  245,  16,    231,     16,   245,   239,    231,    231,    231,  236,
+  /* hdr    grn     pin     sefg  sebg    bef   beb     tifg  tibg */
+     250,   231,    231,    16,   231,   16,     231,    16,   245,
+     { 231, 250, 245, 239, 244, 252 },  231,  16, 231 },
+  /* ansi: 8-color fallback — everything white, reverse bars
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  7,   0,     7,       0,    7,     7,      7,      7,      0,    7,
+     7,     7,     7,      0,    7,     0,      7,      0,    7,
+     { 7, 7, 7, 7, 7, 7 },  7,  0, 7 }
+},
+
+{ "green",
+  /* ext: monochrome green — classic phosphor terminal look
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  28,   16,    34,      16,   34,    22,     46,     46,     46,   22,
+  /* hdr    grn     pin     sefg  sebg    bef   beb     tifg  tibg */
+     118,   46,     82,     16,   46,    16,     46,     16,   34,
+     { 46, 82, 118, 76, 34, 28 },  46,  16, 34 },
+  /* ansi: 8-color fallback — everything green, reverse bars
+     brd  topfg  topbg   selfg selbg  done    pend    bngo    sfg   sbg */
+  {  2,   0,     2,       0,    2,     2,      2,      2,      0,    2,
+     2,     2,     2,      0,    2,     0,      2,      0,    2,
+     { 2, 2, 2, 2, 2, 2 },  2,  0, 2 }
+},
+
+};
+
+#undef BLACK
+#undef RED
+#undef GREEN
+#undef YELLOW
+#undef BLUE
+#undef MAGENTA
+#undef CYAN
+#undef WHITE
+
+static const Theme *g_theme = &THEMES[0];
+static int  cur_theme_idx = 0;
+static char theme_name[32] = "meowdo";   /* persisted in meowdo.json */
+static char cli_theme[32]  = "";         /* --theme NAME */
+
+static int theme_index_by_name(const char *n) {
+    for (int i=0;i<N_THEMES;i++)
+        if (!strcmp(THEMES[i].name,n)) return i;
+    return -1;
+}
+
+static void apply_spec(const ThemeSpec *s) {
+    init_pair(C_BORDER, s->border, -1);
+    init_pair(C_TOPBAR, s->topbar_fg, s->topbar_bg);
+    init_pair(C_SEL,    s->sel_fg,    s->sel_bg);
+    init_pair(C_DONE,   s->done, -1);
+    init_pair(C_PEND,   s->pend, -1);
+    init_pair(C_BONGO,  s->bongo, -1);
+    init_pair(C_SBAR,   s->sbar_fg,  s->sbar_bg);
+    init_pair(C_HDR,    s->hdr, -1);
+    init_pair(C_GREEN,  s->green, -1);
+    init_pair(C_PIN,    s->pin, -1);
+    init_pair(C_TAG1,   s->tag[0], -1);
+    init_pair(C_TAG2,   s->tag[1], -1);
+    init_pair(C_TAG3,   s->tag[2], -1);
+    init_pair(C_TAG4,   s->tag[3], -1);
+    init_pair(C_SEARCH, s->search_fg, s->search_bg);
+    init_pair(C_BEAT,   s->beat_fg,   s->beat_bg);
+    init_pair(C_TITLE,  s->title_fg,  s->title_bg);
+    init_pair(C_TAG5,   s->tag[4], -1);
+    init_pair(C_TAG6,   s->tag[5], -1);
+    init_pair(C_TAG7,   s->tag7, -1);
+    init_pair(C_TAG8,   s->tag8_fg, s->tag8_bg);
+}
+
+static void apply_theme(void) {
+    apply_spec((COLORS>=256) ? &g_theme->ext : &g_theme->ansi);
+}
+
+/* precedence: --theme > MEOWDO_THEME > saved (meowdo.json) > default */
+static void resolve_theme(void) {
+    const char *env  = getenv("MEOWDO_THEME");
+    const char *want = cli_theme[0]  ? cli_theme
+                     : (env && env[0]) ? env : theme_name;
+    int idx = theme_index_by_name(want);
+    if (idx < 0) {
+        fprintf(stderr,"meowdo: unknown theme '%s' — available:",want);
+        for (int i=0;i<N_THEMES;i++) fprintf(stderr," %s",THEMES[i].name);
+        fprintf(stderr,"\n");
+        idx = 0;
+    }
+    cur_theme_idx = idx;
+    g_theme = &THEMES[idx];
+    snprintf(theme_name,sizeof theme_name,"%s",g_theme->name);
+}
+
 /* ── UTF-8 capability flag (set at startup) ── */
 static bool g_utf8 = 0;
 
@@ -550,6 +765,12 @@ static int todos_load(void) {
                     if (!jp_note_obj(&J)) { ok=0; break; }
                 }
             }
+            else if (!strcmp(key,"theme")) {
+                char tn[32];
+                if (!jp_string(&J,tn,sizeof tn)) { ok=0; break; }
+                int ti=theme_index_by_name(tn);
+                if (ti>=0) snprintf(theme_name,sizeof theme_name,"%s",THEMES[ti].name);
+            }
             else jp_skip_value(&J);
         }
     }
@@ -559,7 +780,7 @@ static int todos_load(void) {
 
 static void todos_save(void) {
     FILE *f=fopen(todo_path,"w"); if(!f) return;
-    fprintf(f,"{\n \"version\": 1,\n \"tasks\": [\n");
+    fprintf(f,"{\n \"version\": 1,\n \"theme\": \"%s\",\n \"tasks\": [\n", theme_name);
     for (int i=0;i<todo_count;i++){
         Todo *t=&todos[i];
         fprintf(f,"  {\"pinned\": %s, \"done\": %s, \"tag\": ",
@@ -2216,7 +2437,10 @@ static void print_help(void) {
     printf("Usage: meowdo [OPTIONS]\n\n");
     printf("Options:\n");
     printf("  --version    Show version information\n");
-    printf("  --help       Show this help message\n\n");
+    printf("  --help       Show this help message\n");
+    printf("  --theme NAME Start with a color theme:\n");
+    printf("               meowdo, midnight, dracula, gruvbox, nord, solarized-light,\n");
+    printf("               white, green\n\n");
     printf("Keys:\n");
     printf("  Tab          Cycle TASKS / SCHEDULED / NOTES (Shift-Tab back)\n");
     printf("  j/k          Navigate up/down\n");
@@ -2230,6 +2454,7 @@ static void print_help(void) {
     printf("  Space        Toggle done/not done\n");
     printf("  p            Toggle pin\n");
     printf("  t            Set/clear tag\n");
+    printf("  T            Cycle color theme\n");
     printf("  S            Schedule task (hidden until then)\n");
     printf("  u            Release scheduled task now\n");
     printf("  d            Delete selected task / note\n");
@@ -2253,10 +2478,18 @@ static bool parse_args(int argc, char *argv[]) {
             print_version();
             return true;
         }
-        else if (strcmp(argv[i], "--help") == 0 || 
+        else if (strcmp(argv[i], "--help") == 0 ||
                  strcmp(argv[i], "-h") == 0) {
             print_help();
             return true;
+        }
+        else if (strcmp(argv[i], "--theme") == 0) {
+            if (i+1 >= argc) {
+                printf("meowdo: --theme requires a name\n");
+                printf("Try 'meowdo --help' for more information.\n");
+                return true;
+            }
+            snprintf(cli_theme, sizeof cli_theme, "%s", argv[++i]);
         }
         else {
             printf("Unknown option: %s\n", argv[i]);
@@ -2279,6 +2512,9 @@ int main(int argc, char *argv[]){
     g_utf8 = detect_utf8();
     BONGO   = g_utf8 ? BONGO_UTF8 : BONGO_ASCII;
     build_paths();
+    if (!todos_load() && todos_import_legacy())
+        todos_save();   /* one-time migration from legacy todos.txt */
+    resolve_theme();   /* stderr warning is safe: terminal not in curses mode yet */
     initscr();
     cbreak(); noecho(); curs_set(0);
     keypad(stdscr,TRUE);
@@ -2286,31 +2522,8 @@ int main(int argc, char *argv[]){
               | BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
     if(!has_colors()){endwin();puts("need color terminal");return 1;}
     start_color(); use_default_colors();
+    apply_theme();
 
-    init_pair(C_BORDER, COLOR_CYAN,    -1);
-    init_pair(C_TOPBAR, COLOR_BLACK,   COLOR_MAGENTA);
-    init_pair(C_SEL,    COLOR_BLACK,   COLOR_CYAN);
-    init_pair(C_DONE,   COLOR_WHITE,   -1);
-    init_pair(C_PEND,   COLOR_YELLOW,  -1);
-    init_pair(C_BONGO,  COLOR_MAGENTA, -1);
-    init_pair(C_SBAR,   COLOR_BLACK,   COLOR_BLUE);
-    init_pair(C_HDR,    COLOR_CYAN,    -1);
-    init_pair(C_GREEN,  COLOR_GREEN,   -1);
-    init_pair(C_PIN,    COLOR_RED,     -1);
-    init_pair(C_TAG1,   COLOR_GREEN,   -1);
-    init_pair(C_TAG2,   COLOR_YELLOW,  -1);
-    init_pair(C_TAG3,   COLOR_CYAN,    -1);
-    init_pair(C_TAG4,   COLOR_MAGENTA, -1);
-    init_pair(C_TAG5,   COLOR_RED,     -1);
-    init_pair(C_TAG6,   COLOR_BLUE,    -1);
-    init_pair(C_TAG7,   COLOR_WHITE,   -1);
-    init_pair(C_TAG8,   COLOR_GREEN,   COLOR_BLUE);
-    init_pair(C_SEARCH, COLOR_BLACK,   COLOR_YELLOW);
-    init_pair(C_BEAT,   COLOR_BLACK,   COLOR_YELLOW);
-    init_pair(C_TITLE,  COLOR_BLACK,   COLOR_CYAN);
-
-    if (!todos_load() && todos_import_legacy())
-        todos_save();   /* one-time migration from legacy todos.txt */
     if (process_reveals()) todos_save();   /* reveal anything already due */
     rebuild_vis(); rebuild_note_vis(); rebuild_sched_vis(); rebuild_tag_cache();
     erase(); refresh();
@@ -2475,12 +2688,23 @@ int main(int argc, char *argv[]){
                             snprintf(t->text,MAX_LINE,"%s",buf);
                             t->created_at=time(NULL);
                             t->sched_at=when;
-                            todo_count++; todos_save();
+                            todo_count++;
+                            /* open the memo editor right away for the new task —
+                               before rebuild_vis(), which re-sorts the todo array */
+                            int memo_saved=popup_edit_ml("Task description",t->desc,sizeof t->desc);
+                            time_t nc=t->created_at;
+                            char ntext[MAX_LINE]; snprintf(ntext,sizeof ntext,"%s",t->text);
+                            todos_save();
                             rebuild_vis(); rebuild_sched_vis();
-                            sel_sched=sched_vis_count-1;
-                            char m[96],tsbuf[32];
+                            /* locate the new task in the soonest-first list */
+                            for(int i=0;i<sched_vis_count;i++)
+                                if(todos[sched_vis[i]].created_at==nc&&!strcmp(todos[sched_vis[i]].text,ntext)){
+                                    sel_sched=i; break;
+                                }
+                            char tsbuf[32],m[128];
                             fmt_ts(when,tsbuf,(int)sizeof tsbuf);
-                            snprintf(m,sizeof m,"will appear %s~",tsbuf);
+                            if(memo_saved) snprintf(m,sizeof m,"will appear %s, description saved! nya~",tsbuf);
+                            else           snprintf(m,sizeof m,"will appear %s~",tsbuf);
                             set_smsg(m);
                         }
                     }
@@ -2500,11 +2724,23 @@ int main(int argc, char *argv[]){
                 char buf[MAX_LINE]="";
                 if(popup("New task","what needs doing?",buf,(int)sizeof buf)&&todo_count<MAX_TODOS){
                     Todo *t=&todos[todo_count];
+                    memset(t,0,sizeof *t);
                     t->done=false;t->pinned=false;t->created_at=time(NULL);t->done_at=0;
                     snprintf(t->tag,  MAX_TAG,  "%s", filter_tag[0]?filter_tag:"none");
                     snprintf(t->text, MAX_LINE, "%s", buf);
-                    todo_count++; todos_save(); rebuild_vis(); sel=vis_count-1;
-                    set_smsg("task added! nya~");
+                    todo_count++;
+                    /* open the memo editor right away for the new task —
+                       before rebuild_vis(), which re-sorts the todo array */
+                    int memo_saved=popup_edit_ml("Task description",t->desc,sizeof t->desc);
+                    time_t nc=t->created_at;
+                    char ntext[MAX_LINE]; snprintf(ntext,sizeof ntext,"%s",t->text);
+                    todos_save(); rebuild_vis();
+                    /* locate the new task (array was re-sorted: pinned first, done last) */
+                    for(int i=0;i<vis_count;i++)
+                        if(todos[vis[i]].created_at==nc&&!strcmp(todos[vis[i]].text,ntext)){
+                            sel=i; break;
+                        }
+                    set_smsg(memo_saved?"task + description saved! nya~":"task added! nya~");
                 }
             }
             /* flush any queued input from popup interaction */
@@ -2758,6 +2994,18 @@ int main(int argc, char *argv[]){
             }
             /* flush any queued input from popup interaction */
             timeout(0); while(getch()!=ERR); timeout(-1);
+            break;
+        }
+
+        case 'T':{   /* cycle color theme */
+            cur_theme_idx=(cur_theme_idx+1)%N_THEMES;
+            g_theme=&THEMES[cur_theme_idx];
+            snprintf(theme_name,sizeof theme_name,"%s",g_theme->name);
+            apply_theme();
+            char m[64];
+            snprintf(m,sizeof m,"theme: %s nya~",g_theme->name);
+            set_smsg(m);
+            todos_save();
             break;
         }
 

@@ -140,6 +140,7 @@ Note that getting this into the [nixpkgs](https://github.com/NixOS/nixpkgs/) rep
 | `Esc` | clear search + tag filter |
 | `1` … `6` | filter by tag (color-coded) |
 | `0` | show all tasks |
+| `T` | cycle color theme |
 | `q` | quit |
 
 ## Mouse
@@ -153,6 +154,32 @@ with `set -g mouse on`):
 | double-click a task / note | open its memo (edit if empty, view otherwise) |
 | scroll wheel | move the selection up / down |
 | click a tab label in the top bar | switch tab |
+
+## Themes
+
+meowdo ships six color themes. Press `T` to cycle through them live, or pick
+one at startup:
+
+```bash
+./meowdo --theme gruvbox
+MEOWDO_THEME=nord ./meowdo
+```
+
+| Theme | Look |
+|-------|------|
+| `meowdo` | classic ANSI palette — follows your terminal's own colors (default) |
+| `midnight` | high-contrast brights, for dark backgrounds |
+| `dracula` | purple/pink/cyan on `#282a36` |
+| `gruvbox` | warm retro palette on `#282828` |
+| `nord` | cool frost blues on `#2e3440` |
+| `solarized-light` | muted palette tuned for light backgrounds |
+| `white` | monochrome — black & white, white text/borders/bars everywhere |
+| `green` | monochrome green — classic green phosphor terminal look |
+
+The chosen theme is saved to `meowdo.json` and restored on the next launch.
+Precedence: `--theme` > `MEOWDO_THEME` > saved theme > `meowdo`.
+Terminals without 256-color support automatically fall back to an 8-color
+version of each theme.
 
 ## Scheduling tasks
 
@@ -182,6 +209,7 @@ every 30 seconds while open, so no cron job or external script is needed.
 ```json
 {
   "version": 1,
+  "theme": "meowdo",
   "tasks": [
     {
       "pinned": false, "done": false,
@@ -262,6 +290,24 @@ Some minimal terminal emulators don't support Unicode braille characters. Try us
 - **Linux:** GNOME Terminal, Konsole, Alacritty, Kitty
 - **macOS:** Terminal.app, iTerm2
 - **Windows:** Windows Terminal, WSL with Windows Terminal
+
+### 🎨 Themes look the same / colors seem limited?
+
+meowdo picks its palette from what your terminal reports. If
+`tput colors` prints `8`, only the 8-color fallback of each theme is used
+(the 256-color palettes need a 256-color terminfo). Check with:
+
+```bash
+tput colors
+```
+
+If your terminal actually supports more colors (most do), set a richer
+TERM for the session:
+
+```bash
+export TERM=xterm-256color
+./meowdo
+```
 
 ### ❌ "ncurses.h: No such file or directory"
 
